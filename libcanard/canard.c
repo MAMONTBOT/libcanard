@@ -889,31 +889,28 @@ static bool tx_ensure_queue_space(canard_t* const self, const size_t total_frame
     return total_frames_needed <= (self->tx.queue_capacity - self->tx.queue_size);
 }
 
-static void tx_promote_staged_transfers(canard_t* const self, const canard_us_t now)
+static void tx_promote_delayed(canard_t* const self, const canard_us_t now)
 {
-    while (true) { // we can use next_greater instead of doing min search every time
-        canard_txfer_t* const tr = CAVL2_TO_OWNER(cavl2_min(self->tx.index_staged), canard_txfer_t, index_staged);
-        if ((tr != NULL) && (now >= tr->staged_until)) {
-            // Reinsert into the staged index at the new position, when the next attempt is due (if any).
-            cavl2_remove(&self->tx.index_staged, &tr->index_staged);
-            tx_stage_if(self, tr);
-            // Enqueue for transmission unless it's been there since the last attempt (stalled interface?)
-            FOREACH_IFACE(i)
-            {
-                if (((tr->iface_bitmap & (1U << i)) != 0) &&
-                    !cavl2_is_inserted(self->tx.index_queue[i], &tr->index_queue[i])) {
-                    CANARD_ASSERT(tr->head[i] != NULL);          // cannot stage without payload, doesn't make sense
-                    CANARD_ASSERT(tr->cursor[i] == tr->head[i]); // must have been rewound after last attempt
-                    const tx_cavl_compare_can_id_user_t user = { .can_id = tr->can_id, .iface_index = (byte_t)i };
-                    (void)cavl2_find_or_insert(&self->tx.index_queue[i], //
-                                               &user,
-                                               tx_cavl_compare_queue,
-                                               &tr->index_queue[i],
-                                               cavl2_trivial_factory);
+    for (byte_t shard = 0; shard < CANARD_TX_SHARDS; shard++) { // Low shards have max arbitration priority
+        while (true) {
+            canard_txfer_t* const tr = LIST_HEAD(self->tx.delayed[shard], canard_txfer_t, list_delayed);
+            if ((tr != NULL) && (now >= tr->delayed_until)) {
+                CANARD_ASSERT(tr->delayed_until > BIG_BANG);
+                // Reinsert into the delayed index at the new position, when the next attempt is due (if any).
+                tx_arm_delay_if(self, tr);
+                FOREACH_IFACE(i)
+                { // Enqueue for transmission unless it's been there since the last attempt (stalled interface?)
+                    const bool add = ((tr->iface_bitmap & (1U << i)) != 0) &&
+                                     !is_listed(&self->tx.pending[shard][i], &tr->list_pending[i]);
+                    if (add) {
+                        CANARD_ASSERT(tr->head[i] != NULL);          // cannot stage without payload, doesn't make sense
+                        CANARD_ASSERT(tr->cursor[i] == tr->head[i]); // must have been rewound after last attempt
+                        enlist_tail(&self->tx.pending[shard][i], &tr->list_pending[i]);
+                    }
                 }
+            } else {
+                break;
             }
-        } else {
-            break;
         }
     }
 }
@@ -939,9 +936,9 @@ static bool tx_push(canard_t* const            self,
     CANARD_ASSERT((!tr->fd) || !transfer_kind_is_v0(tr->kind)); // The caller must ensure this.
     const canard_us_t now = self->vtable->now(self);
 
-    // Promote staged transfers that are now eligible for retransmission to ensure fairness:
-    // if they have the same CAN ID as the new transfer, they should get a chance to go first.
-    tx_promote_staged_transfers(self, now);
+    // Promote delayed transfers that have become eligible for retransmission to ensure fairness:
+    // if they have the same arbitration priority as the new transfer, they should get a chance to go first.
+    tx_promote_delayed(self, now);
 
     // Ensure the queue has enough space. v0 transfers always use Classic CAN regardless of tr->fd.
     const size_t mtu      = tr->fd ? CANARD_MTU_CAN_FD : CANARD_MTU_CAN_CLASSIC;
