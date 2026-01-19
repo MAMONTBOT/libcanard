@@ -138,8 +138,9 @@ typedef enum canard_prio_t
 /// This number must not be less than three bits to ensure that the priority field is handled correctly.
 /// Larger values improve list manipulation performance at the cost of some memory footprint.
 /// - 3 bits ensure that each priority level has its own shard, which is the bare minimum.
-/// - 4 bits ensure that messages and RPC-service transfers are separated into dedicated shards.
-/// - 5 bits ensure that messages, requests, and responses are all separated.
+/// - 4 bits ensure that messages and RPC-service transfers are separated into dedicated shards. Recommended choice.
+/// - 5 bits ensure that messages, requests, and responses are all separated. Good for higher-bandwidth applications.
+/// - Very high-throughput nodes (large MCUs or non-deeply-embedded systems) can go up to 8 bits and beyond.
 #define CANARD_TX_SHARDING_BITS 4U
 #define CANARD_TX_SHARDS        (1U << CANARD_TX_SHARDING_BITS)
 
@@ -280,6 +281,9 @@ struct canard_subscription_t
 
 typedef struct canard_vtable_t
 {
+    /// The current monotonic time in microseconds. Must be a non-negative non-decreasing value.
+    canard_us_t (*now)(canard_t*);
+
     /// A new P2P message is received.
     ///
     /// The topic hash bound is less than or equal the true topic hash, which enables easy lookup using lower bounds.
@@ -296,14 +300,13 @@ typedef struct canard_vtable_t
                    uint_least8_t      transfer_id,
                    canard_bytes_mut_t payload);
 
-    /// Submit one CAN frame for transmission via the specified interface. It is guaranteed that now<=deadline.
+    /// Submit one CAN frame for transmission via the specified interface.
     /// If the data is empty (size==0), the data pointer may be NULL.
     /// Returns true if the frame was accepted for transmission, false if there is no free mailbox (try again later).
     /// The callback must not mutate the TX pipeline (no publish/cancel/free/etc).
     /// If the can_data needs to be retained for later retransmission, use canard_refcount_inc()/canard_refcount_dec().
     bool (*tx)(canard_t*,
-               const canard_user_context_t*,
-               canard_us_t    now,
+               canard_user_context_t,
                canard_us_t    deadline,
                uint_least8_t  iface_index,
                bool           fd,
@@ -315,7 +318,7 @@ typedef struct canard_vtable_t
     /// This is the same user context that was passed to canard_publish().
     /// The callback must not mutate the TX pipeline (no publish/cancel/free/etc).
     /// The transmission will be cancelled if the returned subject-ID exceeds CANARD_SUBJECT_ID_MAX.
-    uint32_t (*tx_subject_id)(canard_t*, const canard_user_context_t*);
+    uint32_t (*tx_subject_id)(canard_t*, canard_user_context_t);
 
     /// Reconfigure the acceptance filters of the CAN controller hardware.
     /// The prior configuration, if any, is replaced entirely.
@@ -375,11 +378,16 @@ struct canard_t
         /// of insertion and cancellation paths. Each pending queue is a simple FIFO; the priority ordering is done
         /// by having multiple queues, one per TX shard. This does not follow the full CAN ID arbitration order,
         /// but it is sufficient because the leading sharding bits of the CAN ID provide sufficient selectivity.
+        ///
+        /// The pending list contains transfers that are ready to be transmitted immediately.
+        /// The delayed list contains transfers that will become eligible for transmission in the future;
+        /// these are either reliable transfers waiting for their next retransmission attempt unless acknowledged,
+        /// or transfers that are backlogged after pending reliable transfers to maintain the strict transmission
+        /// ordering. Reliable transfers are special in the sense of ordering because the same transfer may be
+        /// promoted to pending more than once, which may cause reordering; the backlog addresses this.
         canard_list_t pending[CANARD_TX_SHARDS][CANARD_IFACE_COUNT]; ///< Next to transmit at the head.
-        canard_list_t staged[CANARD_TX_SHARDS];                      ///< Soonest retry time at the head.
-        canard_list_t backlog[CANARD_TX_SHARDS];                     ///< Oldest at the head.
-        canard_list_t oldest_reliable;                               ///< All reliable transfers, oldest at the head.
-        canard_list_t oldest_best_effort; ///< Ditto for best-effort. Together they list ALL transfers.
+        canard_list_t delayed[CANARD_TX_SHARDS]; ///< Soonest retry time at the head. HEAT_DEATH if backlogged, at tail.
+        canard_list_t oldest[2]; ///< ALL transfers, oldest at head, sharded by reliability (1=reliable).
     } tx;
 
     struct
@@ -464,7 +472,7 @@ void canard_free(canard_t* const self);
 /// The function must be called asap once any of the interfaces for which there are pending outgoing transfers
 /// become writable, and not less frequently than once in a few milliseconds. The invocation rate defines the
 /// resolution of deadline handling.
-void canard_poll(canard_t* const self, const canard_us_t now, const uint_least8_t tx_ready_iface_bitmap);
+void canard_poll(canard_t* const self, const uint_least8_t tx_ready_iface_bitmap);
 
 /// Returns a bitmap of interfaces that have pending transmissions. This is useful for IO multiplexing.
 uint_least8_t canard_pending_ifaces(const canard_t* const self);
@@ -493,7 +501,6 @@ bool canard_unrespond(canard_t* const self, const uint_least8_t destination_node
 /// (e.g., store a topic pointer in there).
 /// Pinned subject-IDs equal the topic hash and as such do not require postponed resolution.
 bool canard_publish(canard_t* const               self,
-                    const canard_us_t             now,
                     const canard_us_t             deadline,
                     const uint_least8_t           iface_bitmap,
                     const canard_prio_t           priority,
@@ -504,7 +511,6 @@ bool canard_publish(canard_t* const               self,
                     const canard_on_tx_feedback_t feedback);
 
 bool canard_respond(canard_t* const               self,
-                    const canard_us_t             now,
                     const canard_us_t             deadline,
                     const uint_least8_t           destination_node_id,
                     const canard_prio_t           priority,
@@ -529,7 +535,6 @@ void canard_unsubscribe(canard_t* const self, canard_subscription_t* const subsc
 
 /// Sugar: a v1.0 message is just a pinned best-effort v1.1 message.
 static inline bool canard_1v0_publish(canard_t* const            self,
-                                      const canard_us_t          now,
                                       const canard_us_t          deadline,
                                       const uint_least8_t        iface_bitmap,
                                       const canard_prio_t        priority,
@@ -538,7 +543,6 @@ static inline bool canard_1v0_publish(canard_t* const            self,
                                       const canard_bytes_chain_t payload)
 {
     return (subject_id <= CANARD_SUBJECT_ID_MAX_1v0) && canard_publish(self,
-                                                                       now,
                                                                        deadline,
                                                                        iface_bitmap,
                                                                        priority,
@@ -550,7 +554,6 @@ static inline bool canard_1v0_publish(canard_t* const            self,
 }
 
 bool canard_1v0_request(canard_t* const            self,
-                        const canard_us_t          now,
                         const canard_us_t          deadline,
                         const canard_prio_t        priority,
                         const uint16_t             service_id,
@@ -559,7 +562,6 @@ bool canard_1v0_request(canard_t* const            self,
                         const canard_bytes_chain_t payload);
 
 bool canard_1v0_respond(canard_t* const            self,
-                        const canard_us_t          now,
                         const canard_us_t          deadline,
                         const canard_prio_t        priority,
                         const uint16_t             service_id,
@@ -593,7 +595,6 @@ bool canard_1v0_subscribe_response(canard_t* const                           sel
 /// and setting the two least significant bits to 1: prio_v0=(prio<<2)|3.
 /// All legacy transfers are always sent in Classic CAN mode regardless of the FD flag.
 bool canard_0v1_publish(canard_t* const            self,
-                        const canard_us_t          now,
                         const canard_us_t          deadline,
                         const uint_least8_t        iface_bitmap,
                         const canard_prio_t        priority,
@@ -603,7 +604,6 @@ bool canard_0v1_publish(canard_t* const            self,
                         const canard_bytes_chain_t payload);
 
 bool canard_0v1_request(canard_t* const            self,
-                        const canard_us_t          now,
                         const canard_us_t          deadline,
                         const canard_prio_t        priority,
                         const uint_least8_t        data_type_id,
@@ -613,7 +613,6 @@ bool canard_0v1_request(canard_t* const            self,
                         const canard_bytes_chain_t payload);
 
 bool canard_0v1_respond(canard_t* const            self,
-                        const canard_us_t          now,
                         const canard_us_t          deadline,
                         const canard_prio_t        priority,
                         const uint_least8_t        data_type_id,
