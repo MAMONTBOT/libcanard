@@ -229,6 +229,28 @@ static uint16_t crc_add_chain(uint16_t crc, const canard_bytes_chain_t chain) //
 
 // ---------------------------------------------      LIST CONTAINER       ---------------------------------------------
 
+/// Remove an item from a singly-linked list. No effect if the item is not in the list.
+// NOLINTNEXTLINE(bugprone-macro-parentheses) -- intentional for type* declarations
+#define SLIST_REMOVE(root_ptr, item, type, next_field)     \
+    do {                                                   \
+        type** root_ = (root_ptr);                         \
+        if (*root_ == (item)) {                            \
+            *root_ = (item)->next_field;                   \
+        } else if (*root_ != NULL) {                       \
+            type* prev_ = *root_;                          \
+            type* curr_ = (*root_)->next_field;            \
+            while ((curr_ != NULL) && (curr_ != (item))) { \
+                prev_ = curr_;                             \
+                curr_ = curr_->next_field;                 \
+            }                                              \
+            if (curr_ == (item)) {                         \
+                prev_->next_field = curr_->next_field;     \
+            }                                              \
+        } else {                                           \
+            (void)0;                                       \
+        }                                                  \
+    } while (0)
+
 static bool is_listed(const canard_list_t* const list, const canard_listed_t* const member)
 {
     return (member->next != NULL) || (member->prev != NULL) || (list->head == member);
@@ -694,81 +716,30 @@ static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const b
     // Remove from pending transmission lists.
     for (byte_t i = 0; i < CANARD_IFACE_COUNT_MAX; i++) {
         if ((tr->iface_bitmap_pending & (1U << i)) != 0U) {
-            CANARD_ASSERT(self->tx.pending[i] != NULL); // If it's marked as pending, there must be something.
-            if (self->tx.pending[i] == tr) {
-                self->tx.pending[i] = tr->next_pending[i];
-            } else {
-                canard_txfer_t* prev = self->tx.pending[i];
-                canard_txfer_t* curr = self->tx.pending[i];
-                while (true) {
-                    curr = curr->next_pending[i];
-                    CANARD_ASSERT(curr != NULL); // We must find it eventually!
-                    if (curr == tr) {
-                        prev->next_pending[i] = curr->next_pending[i];
-                        break;
-                    }
-                    prev = curr;
-                }
-            }
+            CANARD_ASSERT(self->tx.pending[i] != NULL);
+            SLIST_REMOVE(&self->tx.pending[i], tr, canard_txfer_t, next_pending[i]);
         }
     }
-
     // Remove from the oldest list.
     canard_txfer_t** const oldest_list = tr->reliable ? &self->tx.oldest_reliable : &self->tx.oldest_best_effort;
-    if (*oldest_list == tr) {
-        *oldest_list = tr->next_oldest;
-    } else {
-        canard_txfer_t* prev = *oldest_list;
-        canard_txfer_t* curr = (*oldest_list)->next_oldest;
-        while ((curr != NULL) && (curr != tr)) {
-            prev = curr;
-            curr = curr->next_oldest;
-        }
-        if (curr == tr) {
-            prev->next_oldest = curr->next_oldest;
-        }
+    SLIST_REMOVE(oldest_list, tr, canard_txfer_t, next_oldest);
+    // Remove from staged list (only reliable transfers can be staged).
+    if (tr->reliable) {
+        SLIST_REMOVE(&self->tx.staged, tr, canard_txfer_t, next_staged);
     }
-
-    // Remove from staged index.
-    if (tr->reliable && (self->tx.staged != NULL)) {
-        if (self->tx.staged == tr) {
-            self->tx.staged = tr->next_staged;
-        } else {
-            canard_txfer_t* prev = self->tx.staged;
-            canard_txfer_t* curr = self->tx.staged->next_staged;
-            while ((curr != NULL) && (curr != tr)) {
-                prev = curr;
-                curr = curr->next_staged;
-            }
-            if (curr == tr) {
-                prev->next_staged = curr->next_staged;
-            }
-        }
-    }
-
-    // Remove from backlog list. For that, we need to find the predecessor first.
+    // If tr was in a backlog (blocked behind another transfer), remove it from the owner's backlog chain.
+    // A transfer is in a backlog if it's reliable and was not pending (not yet ready for transmission).
     const bool not_pending = (tr->iface_bitmap_pending & CANARD_IFACE_BITMAP_ALL) == 0;
-    if (tr->reliable && not_pending && (self->tx.oldest_reliable != NULL)) {
-        canard_txfer_t* owner = self->tx.oldest_reliable;
-        while (owner != NULL) {
-            if (owner->topic_hash == tr->topic_hash) {
-                if (owner->next_backlog == tr) {
-                    owner->next_backlog = tr->next_backlog;
-                } else {
-                    canard_txfer_t* prev = owner;
-                    canard_txfer_t* curr = owner->next_backlog;
-                    while ((curr != NULL) && (curr != tr)) {
-                        prev = curr;
-                        curr = curr->next_backlog;
-                    }
-                    if (curr == tr) {
-                        prev->next_backlog = curr->next_backlog;
-                    }
-                }
+    if (tr->reliable && not_pending) {
+        for (canard_txfer_t* owner = self->tx.oldest_reliable; owner != NULL; owner = owner->next_oldest) {
+            if ((owner != tr) && (owner->topic_hash == tr->topic_hash)) {
+                SLIST_REMOVE(&owner->next_backlog, tr, canard_txfer_t, next_backlog);
             }
-            owner = owner->next_backlog;
         }
     }
+    // TODO: If tr has backlog successors, they should be promoted here.
+    // For now, retiring a transfer with successors will leave them orphaned (they'll eventually expire).
+    // This will be addressed when the full ordering logic is implemented.
 
     // Free the memory. The payload memory may already be empty depending on where we were invoked from.
     txfer_free_payload(tr);
