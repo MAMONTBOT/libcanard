@@ -49,6 +49,9 @@ typedef unsigned char byte_t;
 
 #define PADDING_BYTE_VALUE 0U
 
+#define PRIO_SHIFT 26U
+#define PRIO_MASK  0x7U
+
 /// The MSb of the topic hash is set to this value for P2P transfers to allow distinguishing them from messages.
 /// The LSb contain: (can_id & ((1<<26)-1)) >> 7.
 #define TOPIC_HASH_MSb_SERVICE 0xFFFFFFFF00000000ULL
@@ -62,6 +65,8 @@ typedef unsigned char byte_t;
 #define TAIL_SOT    128U
 #define TAIL_EOT    64U
 #define TAIL_TOGGLE 32U
+
+#define FOREACH_IFACE(i) for (size_t i = 0; i < CANARD_IFACE_COUNT; i++)
 
 typedef enum transfer_kind_t
 {
@@ -427,44 +432,47 @@ void canard_refcount_dec(const canard_bytes_t obj)
 struct canard_txfer_t
 {
     /// Memory-efficient but not very fast indexes optimized for a low number of pending transfers.
-    canard_txfer_t* next_pending[CANARD_IFACE_COUNT_MAX];
-    canard_txfer_t* next_staged;
+    canard_txfer_t* next_pending[CANARD_IFACE_COUNT];
+    canard_txfer_t* next_staged_or_backlogged; ///< A transfer cannot be both staged and backlogged.
     canard_txfer_t* next_oldest;
-    canard_txfer_t* next_backlog; ///< Transfers on the same topic that cannot proceed until this one is done.
 
     /// Application closure.
     canard_on_tx_feedback_t feedback;
     canard_user_context_t   user_context;
 
+    /// Mutable transmission state. All other fields, except for the index handles, are immutable.
+    ///
     /// We always keep a pointer to the head of the spool, plus a cursor that scans the frames during transmission.
     /// Both are NULL if the payload is destroyed (i.e., after the last attempt is done and we're waiting for ack).
     /// The head points to the first frame unless it is known that no (further) retransmissions are needed,
     /// in which case the old head is dereferenced and the head points to the next frame to transmit.
-    tx_frame_t* head[CANARD_IFACE_COUNT_MAX];
-
-    /// Mutable transmission state. All other fields, except for the index handles, are immutable.
-    tx_frame_t* cursor[CANARD_IFACE_COUNT_MAX];
-    byte_t      epoch; ///< Does not overflow due to exponential backoff; e.g. 1us with epoch=48 => 9 years.
-    byte_t      iface_bitmap_pending; ///< Interfaces where the transfer is pending transmission.
-    canard_us_t staged_until;         ///< When the transfer becomes eligible for retransmission.
+    ///
+    /// Flags staged and backlogged are mutually exclusive.
+    tx_frame_t* head[CANARD_IFACE_COUNT];
+    tx_frame_t* cursor[CANARD_IFACE_COUNT]; // TODO: NULL means no longer pending on iface?
+    byte_t      epoch;                      ///< No overflow due to exponential backoff; e.g. 1us @ epoch=48 => 9 years.
+    byte_t      iface_bitmap_pending;       ///< Interfaces where the transfer is pending transmission.
+    byte_t      staged     : 1;             ///< Scheduled for retransmission unless acknowledged or cancelled.
+    byte_t      backlogged : 1;             ///< Not eligible for transmission yet due to ordering constraint.
+    canard_us_t staged_until;               ///< When the transfer becomes eligible for retransmission.
 
     /// Constant transfer properties supplied by the client.
     /// The remote_* fields are identical to the local ones except in the case of P2P transfers, where
     /// they contain the values encoded in the P2P header. This is needed to find pending acks (to minimize duplicates),
     /// and to report the correct values via the feedback callback for P2P transfers.
     /// By default, upon construction, the remote_* fields equal the local ones, which is valid for ordinary messages.
-    byte_t      iface_bitmap_requested; ///< Guaranteed to have at least one bit set within CANARD_IFACE_COUNT_MAX.
-    byte_t      kind               : 3; // byte begin
-    byte_t      transfer_id        : 5;
-    byte_t      remote_transfer_id : 5; // byte begin
-    byte_t      reliable           : 1;
-    byte_t      fd                 : 1;
+    byte_t      iface_bitmap_requested; ///< Guaranteed to have at least one bit set within CANARD_IFACE_COUNT.
+    byte_t      transfer_id;
+    byte_t      remote_transfer_id;
+    byte_t      kind     : 3; ///< transfer_kind_t
+    byte_t      reliable : 1;
+    byte_t      fd       : 1;
     uint32_t    can_id; ///< For v1.1 messages, the subject-ID bits are zeroed. Node-ID is always zeroed.
     uint64_t    topic_hash;
     uint64_t    remote_topic_hash;
     canard_us_t deadline;
 };
-static_assert((CANARD_IFACE_COUNT_MAX > 3) || (sizeof(void*) > 4) || (sizeof(canard_txfer_t) <= 112),
+static_assert((CANARD_IFACE_COUNT > 3) || (sizeof(void*) > 4) || (sizeof(canard_txfer_t) <= 112),
               "On a 32-bit platform with a half-fit heap, the TX transfer object should fit in a 128-byte block");
 
 static canard_txfer_t* txfer_new(const canard_mem_t            mem,
@@ -486,30 +494,37 @@ static canard_txfer_t* txfer_new(const canard_mem_t            mem,
     CANARD_ASSERT((iface_bitmap & CANARD_IFACE_BITMAP_ALL) == iface_bitmap);
     canard_txfer_t* const tr = mem_alloc_zero(mem, sizeof(canard_txfer_t));
     if (tr != NULL) {
-        tr->next_staged            = NULL;
-        tr->next_oldest            = NULL;
-        tr->next_backlog           = NULL;
-        tr->staged_until           = now;
-        tr->epoch                  = 0;
-        tr->iface_bitmap_pending   = 0;
+        FOREACH_IFACE(i) { tr->next_pending[i] = NULL; }
+        tr->next_staged_or_backlogged = NULL;
+        tr->next_oldest               = NULL;
+        //
+        tr->user_context = user_context;
+        tr->feedback     = feedback;
+        //
+        FOREACH_IFACE(i) { tr->head[i] = tr->cursor[i] = NULL; }
+        tr->epoch                = 0;
+        tr->iface_bitmap_pending = 0;
+        tr->staged               = false;
+        tr->backlogged           = false;
+        tr->staged_until         = now;
+        //
         tr->iface_bitmap_requested = iface_bitmap;
-        tr->kind                   = (byte_t)kind;
         tr->transfer_id            = transfer_id & CANARD_TRANSFER_ID_MAX;
         tr->remote_transfer_id     = tr->transfer_id;
+        tr->kind                   = (byte_t)kind;
         tr->reliable               = reliable;
         tr->fd                     = fd;
         tr->can_id                 = can_id;
         tr->deadline               = deadline;
         tr->topic_hash             = topic_hash;
         tr->remote_topic_hash      = topic_hash;
-        tr->user_context           = user_context;
-        tr->feedback               = feedback;
-        for (size_t i = 0; i < CANARD_IFACE_COUNT_MAX; i++) {
-            tr->next_pending[i] = NULL;
-            tr->head[i] = tr->cursor[i] = NULL;
-        }
     }
     return tr;
+}
+
+static canard_prio_t txfer_prio(const canard_txfer_t* const tr)
+{
+    return (canard_prio_t)((tr->can_id >> PRIO_SHIFT) & PRIO_MASK);
 }
 
 static byte_t tx_make_tail_byte(const bool sot, const bool eot, const bool tog, const byte_t transfer_id)
@@ -676,7 +691,8 @@ static tx_frame_t* tx_spool_v0(const canard_mem_t         mem,
 static void txfer_free_payload(canard_txfer_t* const tr)
 {
     CANARD_ASSERT(tr != NULL);
-    for (size_t i = 0; i < CANARD_IFACE_COUNT_MAX; i++) {
+    FOREACH_IFACE(i)
+    {
         const tx_frame_t* frame = tr->head[i];
         while (frame != NULL) {
             const tx_frame_t* const next = frame->next;
@@ -712,34 +728,79 @@ static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const b
                                       .user_context     = tr->user_context };
     CANARD_ASSERT(tr->reliable == (tr->feedback != NULL));
     const canard_on_tx_feedback_t feedback = tr->feedback;
+    const canard_prio_t           prio     = txfer_prio(tr);
 
     // Remove from pending transmission lists.
-    for (byte_t i = 0; i < CANARD_IFACE_COUNT_MAX; i++) {
+    for (byte_t i = 0; i < CANARD_IFACE_COUNT; i++) {
         if ((tr->iface_bitmap_pending & (1U << i)) != 0U) {
-            CANARD_ASSERT(self->tx.pending[i] != NULL);
-            SLIST_REMOVE(&self->tx.pending[i], tr, canard_txfer_t, next_pending[i]);
+            CANARD_ASSERT(self->tx.pending[prio][i] != NULL);
+            SLIST_REMOVE(&self->tx.pending[prio][i], tr, canard_txfer_t, next_pending[i]);
         }
     }
-    // Remove from the oldest list.
-    canard_txfer_t** const oldest_list = tr->reliable ? &self->tx.oldest_reliable : &self->tx.oldest_best_effort;
-    SLIST_REMOVE(oldest_list, tr, canard_txfer_t, next_oldest);
-    // Remove from staged list (only reliable transfers can be staged).
-    if (tr->reliable) {
-        SLIST_REMOVE(&self->tx.staged, tr, canard_txfer_t, next_staged);
+    // Remove from the oldest list. Sharding by reliability shortens the search time.
+    SLIST_REMOVE(tr->reliable ? &self->tx.oldest_reliable : &self->tx.oldest_best_effort, //
+                 tr,
+                 canard_txfer_t,
+                 next_oldest);
+    // Remove from staged list.
+    if (tr->staged) {
+        CANARD_ASSERT(tr->reliable);    // Only reliable transfers can be staged.
+        CANARD_ASSERT(!tr->backlogged); // A transfer can be backlogged, staged, or neither, but not both.
+        SLIST_REMOVE(&self->tx.staged[prio], tr, canard_txfer_t, next_staged_or_backlogged);
     }
-    // If tr was in a backlog (blocked behind another transfer), remove it from the owner's backlog chain.
-    // A transfer is in a backlog if it's reliable and was not pending (not yet ready for transmission).
-    const bool not_pending = (tr->iface_bitmap_pending & CANARD_IFACE_BITMAP_ALL) == 0;
-    if (tr->reliable && not_pending) {
-        for (canard_txfer_t* owner = self->tx.oldest_reliable; owner != NULL; owner = owner->next_oldest) {
-            if ((owner != tr) && (owner->topic_hash == tr->topic_hash)) {
-                SLIST_REMOVE(&owner->next_backlog, tr, canard_txfer_t, next_backlog);
+    // Remove from backlog.
+    if (tr->backlogged) {
+        CANARD_ASSERT((tr->iface_bitmap_pending & CANARD_IFACE_BITMAP_ALL) == 0); // If backlogged, cannot be pending.
+        CANARD_ASSERT(!tr->staged); // A transfer can be backlogged, staged, or neither, but not both.
+        SLIST_REMOVE(&self->tx.backlog[prio], tr, canard_txfer_t, next_staged_or_backlogged);
+    }
+    // If the transfer was not backlogged, it may have been blocking other transfers, but only if it is reliable.
+    // Best-effort transfers do not block anything because in the presence of a stalled interface they may take a
+    // very long time to complete. This implies that concurrent best-effort and reliable transfers on the same topic
+    // may be reordered, which we accept.
+    // The backlog is ordered with the oldest at the head, so the first topic match is the correct one to promote.
+    if ((!tr->backlogged) && tr->reliable) {
+        canard_txfer_t* prev  = NULL;
+        canard_txfer_t* match = self->tx.backlog[prio];
+        while ((match != NULL) && (match->topic_hash != tr->topic_hash)) {
+            prev  = match;
+            match = match->next_staged_or_backlogged;
+        }
+        if (match != NULL) { // Found a matching topic to promote.
+            CANARD_ASSERT(match->topic_hash == tr->topic_hash);
+            CANARD_ASSERT(match->backlogged);
+            CANARD_ASSERT(!match->staged);
+            // Remove from the backlog.
+            match->backlogged = false;
+            if (prev != NULL) {
+                prev->next_staged_or_backlogged = match->next_staged_or_backlogged;
+            } else {
+                self->tx.backlog[prio] = match->next_staged_or_backlogged;
             }
+            // Append to the pending transmission lists for all requested interfaces. Update the iface mask as well.
+            FOREACH_IFACE(i)
+            {
+                match->next_pending[i] = NULL;
+                if ((match->iface_bitmap_requested & (1U << i)) == 0U) {
+                    continue;
+                }
+                canard_txfer_t* item = self->tx.pending[prio][i];
+                if (item == NULL) {
+                    self->tx.pending[prio][i] = match;
+                } else {
+                    while (item->next_pending[i] != NULL) {
+                        CANARD_ASSERT(item->topic_hash != match->topic_hash);
+                        CANARD_ASSERT((item->iface_bitmap_pending & (1U << i)) != 0U);
+                        item = item->next_pending[i];
+                    }
+                    item->next_pending[i] = match;
+                }
+                match->iface_bitmap_pending |= 1U << i;
+            }
+            // Update the staged list.
+            // TODO FIXME
         }
     }
-    // TODO: If tr has backlog successors, they should be promoted here.
-    // For now, retiring a transfer with successors will leave them orphaned (they'll eventually expire).
-    // This will be addressed when the full ordering logic is implemented.
 
     // Free the memory. The payload memory may already be empty depending on where we were invoked from.
     txfer_free_payload(tr);
@@ -795,7 +856,7 @@ static canard_us_t tx_ack_timeout(const canard_us_t baseline, const uint32_t can
     CANARD_ASSERT(baseline > 0);
     // What matters is the actual CAN arbitration priority, not the nominal one.
     // They are equal, but we prefer first-principles derivation here.
-    const byte_t prio = (can_id & CAN_EXT_ID_MASK) >> 26U;
+    const byte_t prio = ((can_id & CAN_EXT_ID_MASK) >> PRIO_SHIFT) & PRIO_MASK;
     CANARD_ASSERT(prio < 8);
     return baseline * (1LL << smaller((size_t)prio + (size_t)attempts, 62)); // NOLINT(*-signed-bitwise)
 }
@@ -846,7 +907,8 @@ static void tx_promote_staged_transfers(canard_t* const self, const canard_us_t 
             cavl2_remove(&self->tx.index_staged, &tr->index_staged);
             tx_stage_if(self, tr);
             // Enqueue for transmission unless it's been there since the last attempt (stalled interface?)
-            for (size_t i = 0; i < CANARD_IFACE_COUNT_MAX; i++) {
+            FOREACH_IFACE(i)
+            {
                 if (((tr->iface_bitmap & (1U << i)) != 0) &&
                     !cavl2_is_inserted(self->tx.index_queue[i], &tr->index_queue[i])) {
                     CANARD_ASSERT(tr->head[i] != NULL);          // cannot stage without payload, doesn't make sense
@@ -919,7 +981,7 @@ static bool tx_push(canard_t* const            self,
     CANARD_ASSERT(self->tx.queue_size <= self->tx.queue_capacity);
     (void)queue_size_before;
     const size_t frame_refcount_inc = popcount(tr->iface_bitmap) - 1U;
-    CANARD_ASSERT(frame_refcount_inc < CANARD_IFACE_COUNT_MAX);
+    CANARD_ASSERT(frame_refcount_inc < CANARD_IFACE_COUNT);
     if (frame_refcount_inc > 0) {
         tx_frame_t* frame = spool;
         while (frame != NULL) {
@@ -929,7 +991,8 @@ static bool tx_push(canard_t* const            self,
     }
 
     // Enqueue for transmission immediately.
-    for (size_t i = 0; i < CANARD_IFACE_COUNT_MAX; i++) {
+    FOREACH_IFACE(i)
+    {
         if ((tr->iface_bitmap & (1U << i)) != 0) {
             const tx_cavl_compare_can_id_user_t user = { .can_id = tr->can_id, .iface_index = (byte_t)i };
             (void)cavl2_find_or_insert(&self->tx.index_queue[i], //
@@ -997,7 +1060,7 @@ bool canard_publish(canard_t* const               self,
         const bool reliable = feedback != NULL;
         const bool pinned   = topic_hash <= CANARD_SUBJECT_ID_MAX_1v0;
         const bool use_1v0  = pinned && !reliable; // fallback to v1.0 whenever possible to maximize interoperability
-        uint32_t   can_id   = ((uint32_t)priority) << 26U; // node-ID will be assigned at transmission time
+        uint32_t   can_id   = ((uint32_t)priority) << PRIO_SHIFT; // node-ID will be assigned at transmission time
         if (use_1v0) {
             can_id |= (3UL << 21U) | (uint32_t)(topic_hash << 8U); // set reserved bits 21 and 22
         } else {
@@ -1078,7 +1141,7 @@ bool canard_0v1_publish(canard_t* const            self,
       (((iface_bitmap & CANARD_IFACE_BITMAP_ALL) != 0) && ((iface_bitmap & CANARD_IFACE_BITMAP_ALL) == iface_bitmap)) &&
       (self->node_id != 0);
     if (ok) {
-        const uint32_t can_id    = (((uint32_t)priority) << 26U) | (3UL << 24U) | ((uint32_t)data_type_id << 8U); // --
+        const uint32_t can_id    = (((uint32_t)priority) << PRIO_SHIFT) | (3UL << 24U) | ((uint32_t)data_type_id << 8U);
         canard_txfer_t* const tr = txfer_new(self->mem.tx_transfer,
                                              now,
                                              deadline,

@@ -42,8 +42,8 @@ extern "C"
 #define CANARD_CYPHAL_VERSION_MINOR 1
 
 /// The library supports at most this many local redundant network interfaces.
-#define CANARD_IFACE_COUNT_MAX  3U
-#define CANARD_IFACE_BITMAP_ALL ((1U << CANARD_IFACE_COUNT_MAX) - 1U)
+#define CANARD_IFACE_COUNT      3U
+#define CANARD_IFACE_BITMAP_ALL ((1U << CANARD_IFACE_COUNT) - 1U)
 
 /// Parameter ranges are inclusive; the lower bound is zero for all.
 #define CANARD_SUBJECT_ID_MAX         0x1FFFFUL
@@ -358,10 +358,11 @@ struct canard_t
         ///
         /// The structures are optimized to minimize the poll complexity, since it is on the hot path, at the expense
         /// of insertion and cancellation paths.
-        canard_txfer_t* pending[CANARD_IFACE_COUNT_MAX]; ///< Next to transmit (highest priority) at the head.
-        canard_txfer_t* staged;                          ///< Soonest retry time at the head.
-        canard_txfer_t* oldest_reliable;                 ///< All reliable transfers, oldest at the head.
-        canard_txfer_t* oldest_best_effort;              ///< Ditto for best-effort. Together they list ALL transfers.
+        canard_txfer_t* pending[CANARD_PRIO_COUNT][CANARD_IFACE_COUNT]; ///< Next to transmit at the head.
+        canard_txfer_t* staged[CANARD_PRIO_COUNT];                      ///< Soonest retry time at the head.
+        canard_txfer_t* backlog[CANARD_PRIO_COUNT];                     ///< Oldest at the head.
+        canard_txfer_t* oldest_reliable;                                ///< All reliable transfers, oldest at the head.
+        canard_txfer_t* oldest_best_effort; ///< Ditto for best-effort. Together they list ALL transfers.
     } tx;
 
     struct
