@@ -259,39 +259,67 @@ static void delist(canard_list_t* const list, canard_listed_t* const member)
     assert((list->head != NULL) == (list->tail != NULL));
 }
 
-/// If the item is already in the list, it will be delisted first. Can be used for moving to the front.
-static void enlist_head(canard_list_t* const list, canard_listed_t* const member)
+/// Insert addendum after anchor. If anchor is NULL, insert at the head.
+/// If the item is already in the list, it will be delisted first. Can be used for moving to the specified position.
+static void enlist_after(canard_list_t* const list, canard_listed_t* const anchor, canard_listed_t* const addendum)
 {
-    delist(list, member);
-    assert((member->next == NULL) && (member->prev == NULL));
+    delist(list, addendum);
+    assert((addendum->next == NULL) && (addendum->prev == NULL));
     assert((list->head != NULL) == (list->tail != NULL));
-    member->next = list->head;
-    if (list->head != NULL) {
-        list->head->prev = member;
-    }
-    list->head = member;
-    if (list->tail == NULL) {
-        list->tail = member;
+    if (anchor == NULL) {
+        addendum->next = list->head;
+        if (list->head != NULL) {
+            list->head->prev = addendum;
+        }
+        list->head = addendum;
+        if (list->tail == NULL) {
+            list->tail = addendum;
+        }
+    } else {
+        addendum->prev = anchor;
+        addendum->next = anchor->next;
+        if (anchor->next != NULL) {
+            anchor->next->prev = addendum;
+        } else {
+            list->tail = addendum;
+        }
+        anchor->next = addendum;
     }
     assert((list->head != NULL) && (list->tail != NULL));
 }
 
-/// If the item is already in the list, it will be delisted first. Can be used for moving to the back.
-static void enlist_tail(canard_list_t* const list, canard_listed_t* const member)
+/// Insert addendum before anchor. If anchor is NULL, insert at the tail.
+/// If the item is already in the list, it will be delisted first. Can be used for moving to the specified position.
+static void enlist_before(canard_list_t* const list, canard_listed_t* const anchor, canard_listed_t* const addendum)
 {
-    delist(list, member);
-    assert((member->next == NULL) && (member->prev == NULL));
+    delist(list, addendum);
+    assert((addendum->next == NULL) && (addendum->prev == NULL));
     assert((list->head != NULL) == (list->tail != NULL));
-    member->prev = list->tail;
-    if (list->tail != NULL) {
-        list->tail->next = member;
-    }
-    list->tail = member;
-    if (list->head == NULL) {
-        list->head = member;
+    if (anchor == NULL) {
+        addendum->prev = list->tail;
+        if (list->tail != NULL) {
+            list->tail->next = addendum;
+        }
+        list->tail = addendum;
+        if (list->head == NULL) {
+            list->head = addendum;
+        }
+    } else {
+        addendum->next = anchor;
+        addendum->prev = anchor->prev;
+        if (anchor->prev != NULL) {
+            anchor->prev->next = addendum;
+        } else {
+            list->head = addendum;
+        }
+        anchor->prev = addendum;
     }
     assert((list->head != NULL) && (list->tail != NULL));
 }
+
+/// If the item is already in the list, it will be delisted first. Can be used for moving to the front/back.
+static void enlist_head(canard_list_t* const list, canard_listed_t* const member) { enlist_after(list, NULL, member); }
+static void enlist_tail(canard_list_t* const list, canard_listed_t* const member) { enlist_before(list, NULL, member); }
 
 #define LIST_MEMBER(ptr, owner_type, owner_field) ((owner_type*)ptr_unbias((ptr), offsetof(owner_type, owner_field)))
 static void* ptr_unbias(const void* const ptr, const size_t offset)
@@ -736,7 +764,12 @@ static void tx_stage_if(canard_t* const self, canard_txfer_t* const tr)
     const canard_us_t timeout = tx_ack_timeout(self->ack_baseline_timeout, tr->can_id, epoch);
     tr->staged_until += timeout;
     if ((tr->deadline - timeout) >= tr->staged_until) {
-        // TODO: insort into the staged list ensuring ordering: smallest staged_until at the head.
+        LIST_FIND_FIRST(self->tx.staged[shard], //
+                        canard_txfer_t,
+                        list_staged,
+                        anchor,
+                        anchor->staged_until > tr->staged_until);
+        enlist_before(&self->tx.staged[shard], anchor ? &anchor->list_staged : NULL, &tr->list_staged);
     }
 }
 
