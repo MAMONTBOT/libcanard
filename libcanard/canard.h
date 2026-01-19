@@ -140,9 +140,14 @@ typedef enum canard_prio_t
 /// - 3 bits ensure that each priority level has its own shard, which is the bare minimum.
 /// - 4 bits ensure that messages and RPC-service transfers are separated into dedicated shards. Recommended choice.
 /// - 5 bits ensure that messages, requests, and responses are all separated. Good for higher-bandwidth applications.
-/// - Very high-throughput nodes (large MCUs or non-deeply-embedded systems) can go up to 8 bits and beyond.
+/// - Very high-throughput nodes (large MCUs or non-deeply-embedded systems) can go up to 8 bits and possibly beyond.
+#ifndef CANARD_TX_SHARDING_BITS
 #define CANARD_TX_SHARDING_BITS 4U
-#define CANARD_TX_SHARDS        (1U << CANARD_TX_SHARDING_BITS)
+#endif
+#if CANARD_TX_SHARDING_BITS < 3
+#error "CANARD_TX_SHARDING_BITS must be at least 3"
+#endif
+#define CANARD_TX_SHARDS (1U << CANARD_TX_SHARDING_BITS)
 
 typedef struct canard_tree_t
 {
@@ -385,6 +390,10 @@ struct canard_t
         /// or transfers that are backlogged after pending reliable transfers to maintain the strict transmission
         /// ordering. Reliable transfers are special in the sense of ordering because the same transfer may be
         /// promoted to pending more than once, which may cause reordering; the backlog addresses this.
+        ///
+        /// The shards are based on the most significant bits of the CAN ID, meaning that the lowest index shard
+        /// has the highest arbitration priority and should be chosen for transmission first. There is no ordering
+        /// preservation guarantee between priority levels (obviously) so they all are treated as independent lists.
         canard_list_t pending[CANARD_TX_SHARDS][CANARD_IFACE_COUNT]; ///< Next to transmit at the head.
         canard_list_t delayed[CANARD_TX_SHARDS]; ///< Soonest retry time at the head. HEAT_DEATH if backlogged, at tail.
         canard_list_t oldest[2]; ///< ALL transfers, oldest at head, sharded by reliability (1=reliable).

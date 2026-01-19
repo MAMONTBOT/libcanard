@@ -334,8 +334,9 @@ static void* ptr_unbias(const void* const ptr, const size_t offset)
 #define LIST_HEAD(list, owner_type, owner_field) LIST_MEMBER((list).head, owner_type, owner_field)
 
 #define LIST_NEXT(member, owner_type, owner_field) LIST_MEMBER((member)->owner_field.next, owner_type, owner_field)
+#define LIST_PREV(member, owner_type, owner_field) LIST_MEMBER((member)->owner_field.prev, owner_type, owner_field)
 
-/// Finds the first element in the list that satisfies the given predicate.
+/// Finds the first element from the head that satisfies the given predicate.
 #define LIST_FIND_FIRST(list, owner_type, owner_field, result, predicate) \
     owner_type* result = LIST_HEAD(list, owner_type, owner_field);        \
     while ((result != NULL) && !(predicate)) {                            \
@@ -566,6 +567,7 @@ static byte_t txfer_shard(const canard_txfer_t* const tr)
 }
 
 static bool txfer_is_reliable(const canard_txfer_t* const tr) { return tr->feedback != NULL; }
+static bool txfer_is_backlogged(const canard_txfer_t* const tr) { return tr->delayed_until == HEAT_DEATH; }
 
 static byte_t tx_make_tail_byte(const bool sot, const bool eot, const bool tog, const byte_t transfer_id)
 {
@@ -766,11 +768,11 @@ static void tx_arm_delay_if(canard_t* const self, canard_txfer_t* const tr)
         }
         new_delayed_until += timeout;
         if ((tr->deadline - timeout) >= new_delayed_until) {
-            LIST_FIND_FIRST(self->tx.delayed[shard], //
+            LIST_FIND_FIRST(self->tx.delayed[shard],
                             canard_txfer_t,
                             list_delayed,
                             anchor,
-                            anchor->delayed_until > tr->delayed_until);
+                            (anchor->delayed_until > tr->delayed_until));
             enlist_before(&self->tx.delayed[shard], anchor ? &anchor->list_delayed : NULL, &tr->list_delayed);
         } else {
             delist(&self->tx.delayed[shard], &tr->list_delayed);
@@ -801,10 +803,10 @@ static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const b
                                                  .transfer_id      = tr->remote_transfer_id,
                                                  .acknowledgements = success ? 1 : 0,
                                                  .user_context     = tr->user_context };
-    const canard_on_tx_feedback_t feedback   = tr->feedback;
+    const canard_on_tx_feedback_t callback   = tr->feedback;
     const byte_t                  shard      = txfer_shard(tr);
     const bool                    reliable   = txfer_is_reliable(tr);
-    const bool                    backlogged = tr->delayed_until == HEAT_DEATH;
+    const bool                    backlogged = txfer_is_backlogged(tr);
 
     // Delist everywhere. Remember that delisting a non-listed entity is a safe no-op.
     for (byte_t i = 0; i < CANARD_IFACE_COUNT; i++) {
@@ -819,13 +821,14 @@ static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const b
     // may be reordered, which we accept.
     // The backlog is ordered with the oldest at the head, so the first topic match is the correct one to promote.
     if ((!backlogged) && reliable) {
-        LIST_FIND_FIRST(self->tx.delayed[shard], //
+        LIST_FIND_FIRST(self->tx.delayed[shard],
                         canard_txfer_t,
                         list_delayed,
                         match,
-                        match->topic_hash == tr->topic_hash);
+                        (match->topic_hash == tr->topic_hash) && (match->delayed_until == HEAT_DEATH));
         if (match != NULL) { // Found a matching topic to promote.
             CANARD_ASSERT(match->topic_hash == tr->topic_hash);
+            CANARD_ASSERT(match->delayed_until == HEAT_DEATH);
             CANARD_ASSERT((match->iface_bitmap & CANARD_IFACE_COUNT) != 0);
             FOREACH_IFACE(i) // Append to the pending transmission lists for all requested interfaces.
             {
@@ -837,7 +840,7 @@ static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const b
                 }
             }
             tx_arm_delay_if(self, match);
-            CANARD_ASSERT(match->delayed_until < HEAT_DEATH);
+            CANARD_ASSERT(match->delayed_until < HEAT_DEATH); // either delayed or removed from the delay index
         }
     }
 
@@ -846,8 +849,8 @@ static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const b
     mem_free(self->mem.tx_transfer, sizeof(canard_txfer_t), tr);
 
     // Finally, when the internal state is updated and consistent, invoke the feedback callback if any.
-    if (feedback != NULL) {
-        feedback(self, fb);
+    if (callback != NULL) {
+        callback(self, fb);
     }
 }
 
@@ -1034,8 +1037,18 @@ static bool tx_push(canard_t* const            self,
 /// Handle an ACK received from a remote node.
 static void tx_receive_ack(canard_t* const self, const uint64_t topic_hash, const byte_t transfer_id)
 {
-    canard_txfer_t* const tr = txfer_find(self, topic_hash, transfer_id);
-    if ((tr != NULL) && tr->reliable) {
+    // Scan from oldest because they are the most likely to match.
+    // We are not expected to hold a large number of pending reliable transfers, so a linear search is acceptable --
+    // up to a couple dozen transfers should be at least on par with a BST lookup.
+    // If this ever becomes a problem, we can add a separate index for pending reliable transfers keyed by topic hash.
+    LIST_FIND_FIRST(self->tx.oldest[1], // Search reliable only; best-effort transfers are not in this list.
+                    canard_txfer_t,
+                    list_oldest,
+                    tr, // Backlogged transfers may possibly have conflicting transfer-ID.
+                    (tr->topic_hash == topic_hash) && (tr->remote_transfer_id == transfer_id) &&
+                      !txfer_is_backlogged(tr));
+    if (tr != NULL) {
+        CANARD_ASSERT(txfer_is_reliable(tr) && (tr->topic_hash == topic_hash) && (tr->transfer_id == transfer_id));
         txfer_retire(self, tr, true);
     }
 }
