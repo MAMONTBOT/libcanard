@@ -537,14 +537,18 @@ static canard_txfer_t* txfer_new(const canard_mem_t            mem,
     CANARD_ASSERT((iface_bitmap & CANARD_IFACE_BITMAP_ALL) == iface_bitmap);
     canard_txfer_t* const tr = mem_alloc_zero(mem, sizeof(canard_txfer_t));
     if (tr != NULL) {
-        FOREACH_IFACE(i) { tr->list_pending[i] = LIST_NULL; }
+        FOREACH_IFACE (i) {
+            tr->list_pending[i] = LIST_NULL;
+        }
         tr->list_delayed = LIST_NULL;
         tr->list_oldest  = LIST_NULL;
         //
         tr->feedback     = feedback;
         tr->user_context = user_context;
         //
-        FOREACH_IFACE(i) { tr->head[i] = tr->cursor[i] = NULL; }
+        FOREACH_IFACE (i) {
+            tr->head[i] = tr->cursor[i] = NULL;
+        }
         tr->epoch         = 0;
         tr->delayed_until = BIG_BANG;
         //
@@ -572,8 +576,7 @@ static bool txfer_is_backlogged(const canard_txfer_t* const tr) { return tr->del
 static void txfer_free_payload(canard_txfer_t* const tr)
 {
     CANARD_ASSERT(tr != NULL);
-    FOREACH_IFACE(i)
-    {
+    FOREACH_IFACE (i) {
         const tx_frame_t* frame = tr->head[i];
         while (frame != NULL) {
             const tx_frame_t* const next = frame->next;
@@ -672,8 +675,7 @@ static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const b
         if (match != NULL) { // Found a matching topic to promote.
             CANARD_ASSERT((match->topic_hash == tr->topic_hash) && txfer_is_backlogged(match));
             CANARD_ASSERT((match->iface_bitmap & CANARD_IFACE_BITMAP_ALL) != 0);
-            FOREACH_IFACE(i) // Append to the pending transmission lists for all requested interfaces.
-            {
+            FOREACH_IFACE (i) { // Append to the pending transmission lists for all requested interfaces.
                 CANARD_ASSERT(!is_listed(&self->tx.pending[shard][i], &match->list_pending[i]));
                 if ((match->iface_bitmap & (1U << i)) != 0U) {
                     CANARD_ASSERT(match->cursor[i] == match->head[i]); // must be rewound to the beginning
@@ -898,8 +900,7 @@ static void tx_promote_delayed(canard_t* const self, const canard_us_t now)
                 CANARD_ASSERT(tr->delayed_until > BIG_BANG);
                 // Reinsert into the delayed index at the new position, when the next attempt is due (if any).
                 tx_arm_delay_if(self, tr);
-                FOREACH_IFACE(i)
-                { // Enqueue for transmission unless it's been there since the last attempt (stalled interface?)
+                FOREACH_IFACE (i) { // Enqueue for transmission unless it's there already (stalled interface?)
                     const bool add = ((tr->iface_bitmap & (1U << i)) != 0) &&
                                      !is_listed(&self->tx.pending[shard][i], &tr->list_pending[i]);
                     if (add) {
@@ -977,8 +978,7 @@ static bool tx_push(canard_t* const            self,
 
     // Enqueue for transmission immediately.
     // TODO: BACKLOG IF NEEDED
-    FOREACH_IFACE(i)
-    {
+    FOREACH_IFACE (i) {
         if ((tr->iface_bitmap & (1U << i)) != 0) {
             const tx_cavl_compare_can_id_user_t user = { .can_id = tr->can_id, .iface_index = (byte_t)i };
             (void)cavl2_find_or_insert(&self->tx.index_queue[i], //
