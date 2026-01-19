@@ -684,24 +684,91 @@ static void txfer_free_payload(canard_txfer_t* const tr)
 /// where pub/sub associations are established and removed automatically, transparently to the application.
 static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const bool success)
 {
-    const canard_tx_feedback_t fb = {
-        .topic_hash       = tr->remote_topic_hash,
-        .transfer_id      = tr->remote_transfer_id,
-        .acknowledgements = success ? 1 : 0,
-        .user_context     = tr->user_context,
-    };
+    const canard_tx_feedback_t fb = { .topic_hash       = tr->remote_topic_hash,
+                                      .transfer_id      = tr->remote_transfer_id,
+                                      .acknowledgements = success ? 1 : 0,
+                                      .user_context     = tr->user_context };
     CANARD_ASSERT(tr->reliable == (tr->feedback != NULL));
     const canard_on_tx_feedback_t feedback = tr->feedback;
 
-    // Remove from all indexes and lists.
-    for (size_t i = 0; i < CANARD_IFACE_COUNT_MAX; i++) {
-        cavl2_remove_if(&self->tx.index_queue[i], &tr->index_queue[i]);
+    // Remove from pending transmission lists.
+    for (byte_t i = 0; i < CANARD_IFACE_COUNT_MAX; i++) {
+        if ((tr->iface_bitmap_pending & (1U << i)) != 0U) {
+            CANARD_ASSERT(self->tx.pending[i] != NULL); // If it's marked as pending, there must be something.
+            if (self->tx.pending[i] == tr) {
+                self->tx.pending[i] = tr->next_pending[i];
+            } else {
+                canard_txfer_t* prev = self->tx.pending[i];
+                canard_txfer_t* curr = self->tx.pending[i];
+                while (true) {
+                    curr = curr->next_pending[i];
+                    CANARD_ASSERT(curr != NULL); // We must find it eventually!
+                    if (curr == tr) {
+                        prev->next_pending[i] = curr->next_pending[i];
+                        break;
+                    }
+                    prev = curr;
+                }
+            }
+        }
     }
-    delist(&self->tx.list_agewise, &tr->list_agewise);
-    (void)cavl2_remove_if(&self->tx.index_staged, &tr->index_staged);
-    cavl2_remove(&self->tx.index_deadline, &tr->index_deadline);
-    cavl2_remove(&self->tx.index_transfer, &tr->index_transfer);
-    (void)cavl2_remove_if(&self->tx.index_transfer_ack, &tr->index_transfer_ack);
+
+    // Remove from the oldest list.
+    canard_txfer_t** const oldest_list = tr->reliable ? &self->tx.oldest_reliable : &self->tx.oldest_best_effort;
+    if (*oldest_list == tr) {
+        *oldest_list = tr->next_oldest;
+    } else {
+        canard_txfer_t* prev = *oldest_list;
+        canard_txfer_t* curr = (*oldest_list)->next_oldest;
+        while ((curr != NULL) && (curr != tr)) {
+            prev = curr;
+            curr = curr->next_oldest;
+        }
+        if (curr == tr) {
+            prev->next_oldest = curr->next_oldest;
+        }
+    }
+
+    // Remove from staged index.
+    if (tr->reliable && (self->tx.staged != NULL)) {
+        if (self->tx.staged == tr) {
+            self->tx.staged = tr->next_staged;
+        } else {
+            canard_txfer_t* prev = self->tx.staged;
+            canard_txfer_t* curr = self->tx.staged->next_staged;
+            while ((curr != NULL) && (curr != tr)) {
+                prev = curr;
+                curr = curr->next_staged;
+            }
+            if (curr == tr) {
+                prev->next_staged = curr->next_staged;
+            }
+        }
+    }
+
+    // Remove from backlog list. For that, we need to find the predecessor first.
+    const bool not_pending = (tr->iface_bitmap_pending & CANARD_IFACE_BITMAP_ALL) == 0;
+    if (tr->reliable && not_pending && (self->tx.oldest_reliable != NULL)) {
+        canard_txfer_t* owner = self->tx.oldest_reliable;
+        while (owner != NULL) {
+            if (owner->topic_hash == tr->topic_hash) {
+                if (owner->next_backlog == tr) {
+                    owner->next_backlog = tr->next_backlog;
+                } else {
+                    canard_txfer_t* prev = owner;
+                    canard_txfer_t* curr = owner->next_backlog;
+                    while ((curr != NULL) && (curr != tr)) {
+                        prev = curr;
+                        curr = curr->next_backlog;
+                    }
+                    if (curr == tr) {
+                        prev->next_backlog = curr->next_backlog;
+                    }
+                }
+            }
+            owner = owner->next_backlog;
+        }
+    }
 
     // Free the memory. The payload memory may already be empty depending on where we were invoked from.
     txfer_free_payload(tr);
