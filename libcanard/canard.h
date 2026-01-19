@@ -394,9 +394,14 @@ struct canard_t
         /// The shards are based on the most significant bits of the CAN ID, meaning that the lowest index shard
         /// has the highest arbitration priority and should be chosen for transmission first. There is no ordering
         /// preservation guarantee between priority levels (obviously) so they all are treated as independent lists.
+        ///
+        /// Unlike Cyphal/UDP, we don't have a dedicated deadline index, again to conserve memory. Instead, we do
+        /// iterative scanning during poll() by storing the iteration cursors here. They are invalidated as needed.
         canard_list_t pending[CANARD_TX_SHARDS][CANARD_IFACE_COUNT]; ///< Next to transmit at the head.
         canard_list_t delayed[CANARD_TX_SHARDS]; ///< Soonest retry time at the head. HEAT_DEATH if backlogged, at tail.
-        canard_list_t oldest[2]; ///< ALL transfers, oldest at head, sharded by reliability (1=reliable).
+        canard_list_t oldest[2];                 ///< ALL transfers, oldest at head, sharded by QoS (1=reliable).
+
+        canard_txfer_t* iterator[2]; ///< For iterative poll() scanning, sharded by QoS like oldest; NULL to restart.
     } tx;
 
     struct

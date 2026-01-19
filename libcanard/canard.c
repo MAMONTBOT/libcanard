@@ -324,12 +324,6 @@ static void enlist_before(canard_list_t* const list, canard_listed_t* const anch
 static void enlist_head(canard_list_t* const list, canard_listed_t* const member) { enlist_after(list, NULL, member); }
 static void enlist_tail(canard_list_t* const list, canard_listed_t* const member) { enlist_before(list, NULL, member); }
 
-#define LIST_MEMBER(ptr, owner_type, owner_field) ((owner_type*)ptr_unbias((ptr), offsetof(owner_type, owner_field)))
-static void* ptr_unbias(const void* const ptr, const size_t offset)
-{
-    return (ptr == NULL) ? NULL : (void*)((char*)ptr - offset);
-}
-
 #define LIST_TAIL(list, owner_type, owner_field) LIST_MEMBER((list).tail, owner_type, owner_field)
 #define LIST_HEAD(list, owner_type, owner_field) LIST_MEMBER((list).head, owner_type, owner_field)
 
@@ -343,6 +337,12 @@ static void* ptr_unbias(const void* const ptr, const size_t offset)
         result = LIST_NEXT(result, owner_type, owner_field);              \
     }                                                                     \
     (void)0
+
+#define LIST_MEMBER(ptr, owner_type, owner_field) ((owner_type*)ptr_unbias((ptr), offsetof(owner_type, owner_field)))
+static void* ptr_unbias(const void* const ptr, const size_t offset)
+{
+    return (ptr == NULL) ? NULL : (void*)((char*)ptr - offset);
+}
 
 #define LIST_NULL                                    \
     (canard_listed_t) { .next = NULL, .prev = NULL }
@@ -569,6 +569,132 @@ static byte_t txfer_shard(const canard_txfer_t* const tr)
 static bool txfer_is_reliable(const canard_txfer_t* const tr) { return tr->feedback != NULL; }
 static bool txfer_is_backlogged(const canard_txfer_t* const tr) { return tr->delayed_until == HEAT_DEATH; }
 
+static void txfer_free_payload(canard_txfer_t* const tr)
+{
+    CANARD_ASSERT(tr != NULL);
+    FOREACH_IFACE(i)
+    {
+        const tx_frame_t* frame = tr->head[i];
+        while (frame != NULL) {
+            const tx_frame_t* const next = frame->next;
+            canard_refcount_dec(tx_frame_view(frame));
+            frame = next;
+        }
+        tr->head[i]   = NULL;
+        tr->cursor[i] = NULL;
+    }
+}
+
+/// Updates the next attempt time and inserts the transfer into the delayed index, unless the next scheduled
+/// transmission time is too close to the deadline, in which case no further attempts will be made.
+///
+/// The idea is that retransmitting the transfer too close to the deadline is pointless, because
+/// the ack may arrive just after the deadline and the transfer would be considered failed anyway.
+/// The solution is to add a small margin before the deadline. The margin is derived using a simple heuristic,
+/// which is subject to review and improvement later on (this is not an API-visible trait).
+static void tx_arm_delay_if(canard_t* const self, canard_txfer_t* const tr)
+{
+    const byte_t shard = txfer_shard(tr);
+    if (!txfer_is_reliable(tr)) {
+        delist(&self->tx.delayed[shard], &tr->list_delayed);
+        tr->delayed_until = BIG_BANG;
+    } else {
+        const byte_t      epoch             = tr->epoch++;
+        const canard_us_t timeout           = tx_ack_timeout(self->ack_baseline_timeout, tr->can_id, epoch);
+        canard_us_t       new_delayed_until = tr->delayed_until;
+        if ((new_delayed_until < 0) || (new_delayed_until == HEAT_DEATH)) {
+            new_delayed_until = self->vtable->now(self); // this is the first attempt
+        }
+        new_delayed_until += timeout;
+        if ((tr->deadline - timeout) >= new_delayed_until) {
+            tr->delayed_until = new_delayed_until;
+            LIST_FIND_FIRST(self->tx.delayed[shard],
+                            canard_txfer_t,
+                            list_delayed,
+                            anchor,
+                            (anchor->delayed_until > tr->delayed_until));
+            enlist_before(&self->tx.delayed[shard], anchor ? &anchor->list_delayed : NULL, &tr->list_delayed);
+        } else {
+            delist(&self->tx.delayed[shard], &tr->list_delayed);
+            tr->delayed_until = BIG_BANG;
+        }
+    }
+}
+
+/// Currently, we use a very simple implementation that ceases delivery attempts after the first acknowledgment
+/// is received, similar to the CAN bus itself. Such mode of reliability is useful in the following scenarios:
+///
+/// - With topics with a single subscriber, or sent via P2P transport (responses to published messages).
+///   With a single recipient, a single acknowledgement is sufficient to guarantee delivery.
+///
+/// - The application only cares about one acknowledgement (anycast), e.g., with modular redundant nodes.
+///
+/// - The application assumes that if one copy was delivered successfully, then other copies have likely
+///   succeeded as well (depends on the required reliability guarantees), similar to the CAN bus.
+///
+/// TODO In the future, there are plans to extend this mechanism to track the number of acknowledgements per topic,
+/// such that we can retain transfers until a specified number of acknowledgements have been received. A remote
+/// node can be considered to have disappeared if it failed to acknowledge a transfer after the maximum number
+/// of attempts have been made. This is somewhat similar in principle to the connection-oriented DDS/RTPS approach,
+/// where pub/sub associations are established and removed automatically, transparently to the application.
+static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const bool success)
+{
+    const canard_tx_feedback_t    fb         = { .topic_hash       = tr->remote_topic_hash,
+                                                 .transfer_id      = tr->remote_transfer_id,
+                                                 .acknowledgements = success ? 1 : 0,
+                                                 .user_context     = tr->user_context };
+    const canard_on_tx_feedback_t callback   = tr->feedback;
+    const byte_t                  shard      = txfer_shard(tr);
+    const bool                    reliable   = txfer_is_reliable(tr);
+    const bool                    backlogged = txfer_is_backlogged(tr);
+
+    // Delist everywhere. Remember that delisting a non-listed entity is a safe no-op.
+    if (self->tx.iterator[reliable] == tr) {
+        self->tx.iterator[reliable] = LIST_NEXT(tr, canard_txfer_t, list_oldest); // May be NULL, is OK.
+    }
+    for (byte_t i = 0; i < CANARD_IFACE_COUNT; i++) {
+        delist(&self->tx.pending[shard][i], &tr->list_pending[i]);
+    }
+    delist(&self->tx.oldest[reliable], &tr->list_oldest);
+    delist(&self->tx.delayed[shard], &tr->list_delayed);
+
+    // If the transfer was not backlogged, it may have been blocking other transfers, but only if it is reliable.
+    // Best-effort transfers do not block anything because in the presence of a stalled interface they may take a
+    // very long time to time out. This implies that concurrent best-effort and reliable transfers on the same topic
+    // may be reordered, which we accept.
+    // The backlog is ordered with the oldest at the head, so the first topic match is the correct one to promote.
+    if ((!backlogged) && reliable) {
+        LIST_FIND_FIRST(self->tx.delayed[shard],
+                        canard_txfer_t,
+                        list_delayed,
+                        match,
+                        (match->topic_hash == tr->topic_hash) && txfer_is_backlogged(match));
+        if (match != NULL) { // Found a matching topic to promote.
+            CANARD_ASSERT((match->topic_hash == tr->topic_hash) && txfer_is_backlogged(match));
+            CANARD_ASSERT((match->iface_bitmap & CANARD_IFACE_BITMAP_ALL) != 0);
+            FOREACH_IFACE(i) // Append to the pending transmission lists for all requested interfaces.
+            {
+                CANARD_ASSERT(!is_listed(&self->tx.pending[shard][i], &match->list_pending[i]));
+                if ((match->iface_bitmap & (1U << i)) != 0U) {
+                    CANARD_ASSERT(match->cursor[i] == match->head[i]); // must be rewound to the beginning
+                    CANARD_ASSERT(match->cursor[i] != NULL);
+                    enlist_tail(&self->tx.pending[shard][i], &match->list_pending[i]);
+                }
+            }
+            tx_arm_delay_if(self, match);
+        }
+    }
+
+    // Free the memory. The payload memory may already be empty depending on where we were invoked from.
+    txfer_free_payload(tr);
+    mem_free(self->mem.tx_transfer, sizeof(canard_txfer_t), tr);
+
+    // Finally, when the internal state is updated and consistent, invoke the feedback callback if any.
+    if (callback != NULL) {
+        callback(self, fb);
+    }
+}
+
 static byte_t tx_make_tail_byte(const bool sot, const bool eot, const bool tog, const byte_t transfer_id)
 {
     return (byte_t)((sot ? TAIL_SOT : 0U) | (eot ? TAIL_EOT : 0U) | (tog ? TAIL_TOGGLE : 0U) |
@@ -730,128 +856,6 @@ static tx_frame_t* tx_spool_v0(const canard_mem_t         mem,
     return head;
 }
 
-static void txfer_free_payload(canard_txfer_t* const tr)
-{
-    CANARD_ASSERT(tr != NULL);
-    FOREACH_IFACE(i)
-    {
-        const tx_frame_t* frame = tr->head[i];
-        while (frame != NULL) {
-            const tx_frame_t* const next = frame->next;
-            canard_refcount_dec(tx_frame_view(frame));
-            frame = next;
-        }
-        tr->head[i]   = NULL;
-        tr->cursor[i] = NULL;
-    }
-}
-
-/// Updates the next attempt time and inserts the transfer into the delayed index, unless the next scheduled
-/// transmission time is too close to the deadline, in which case no further attempts will be made.
-///
-/// The idea is that retransmitting the transfer too close to the deadline is pointless, because
-/// the ack may arrive just after the deadline and the transfer would be considered failed anyway.
-/// The solution is to add a small margin before the deadline. The margin is derived using a simple heuristic,
-/// which is subject to review and improvement later on (this is not an API-visible trait).
-static void tx_arm_delay_if(canard_t* const self, canard_txfer_t* const tr)
-{
-    const byte_t shard = txfer_shard(tr);
-    if (!txfer_is_reliable(tr)) {
-        delist(&self->tx.delayed[shard], &tr->list_delayed);
-        tr->delayed_until = BIG_BANG;
-    } else {
-        const byte_t      epoch             = tr->epoch++;
-        const canard_us_t timeout           = tx_ack_timeout(self->ack_baseline_timeout, tr->can_id, epoch);
-        canard_us_t       new_delayed_until = tr->delayed_until;
-        if ((new_delayed_until < 0) || (new_delayed_until == HEAT_DEATH)) {
-            new_delayed_until = self->vtable->now(self); // this is the first attempt
-        }
-        new_delayed_until += timeout;
-        if ((tr->deadline - timeout) >= new_delayed_until) {
-            LIST_FIND_FIRST(self->tx.delayed[shard],
-                            canard_txfer_t,
-                            list_delayed,
-                            anchor,
-                            (anchor->delayed_until > tr->delayed_until));
-            enlist_before(&self->tx.delayed[shard], anchor ? &anchor->list_delayed : NULL, &tr->list_delayed);
-        } else {
-            delist(&self->tx.delayed[shard], &tr->list_delayed);
-            tr->delayed_until = BIG_BANG;
-        }
-    }
-}
-
-/// Currently, we use a very simple implementation that ceases delivery attempts after the first acknowledgment
-/// is received, similar to the CAN bus itself. Such mode of reliability is useful in the following scenarios:
-///
-/// - With topics with a single subscriber, or sent via P2P transport (responses to published messages).
-///   With a single recipient, a single acknowledgement is sufficient to guarantee delivery.
-///
-/// - The application only cares about one acknowledgement (anycast), e.g., with modular redundant nodes.
-///
-/// - The application assumes that if one copy was delivered successfully, then other copies have likely
-///   succeeded as well (depends on the required reliability guarantees), similar to the CAN bus.
-///
-/// TODO In the future, there are plans to extend this mechanism to track the number of acknowledgements per topic,
-/// such that we can retain transfers until a specified number of acknowledgements have been received. A remote
-/// node can be considered to have disappeared if it failed to acknowledge a transfer after the maximum number
-/// of attempts have been made. This is somewhat similar in principle to the connection-oriented DDS/RTPS approach,
-/// where pub/sub associations are established and removed automatically, transparently to the application.
-static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const bool success)
-{
-    const canard_tx_feedback_t    fb         = { .topic_hash       = tr->remote_topic_hash,
-                                                 .transfer_id      = tr->remote_transfer_id,
-                                                 .acknowledgements = success ? 1 : 0,
-                                                 .user_context     = tr->user_context };
-    const canard_on_tx_feedback_t callback   = tr->feedback;
-    const byte_t                  shard      = txfer_shard(tr);
-    const bool                    reliable   = txfer_is_reliable(tr);
-    const bool                    backlogged = txfer_is_backlogged(tr);
-
-    // Delist everywhere. Remember that delisting a non-listed entity is a safe no-op.
-    for (byte_t i = 0; i < CANARD_IFACE_COUNT; i++) {
-        delist(&self->tx.pending[shard][i], &tr->list_pending[i]);
-    }
-    delist(&self->tx.oldest[reliable], &tr->list_oldest);
-    delist(&self->tx.delayed[shard], &tr->list_delayed);
-
-    // If the transfer was not backlogged, it may have been blocking other transfers, but only if it is reliable.
-    // Best-effort transfers do not block anything because in the presence of a stalled interface they may take a
-    // very long time to time out. This implies that concurrent best-effort and reliable transfers on the same topic
-    // may be reordered, which we accept.
-    // The backlog is ordered with the oldest at the head, so the first topic match is the correct one to promote.
-    if ((!backlogged) && reliable) {
-        LIST_FIND_FIRST(self->tx.delayed[shard],
-                        canard_txfer_t,
-                        list_delayed,
-                        match,
-                        (match->topic_hash == tr->topic_hash) && txfer_is_backlogged(match));
-        if (match != NULL) { // Found a matching topic to promote.
-            CANARD_ASSERT((match->topic_hash == tr->topic_hash) && txfer_is_backlogged(match));
-            CANARD_ASSERT((match->iface_bitmap & CANARD_IFACE_COUNT) != 0);
-            FOREACH_IFACE(i) // Append to the pending transmission lists for all requested interfaces.
-            {
-                CANARD_ASSERT(!is_listed(&self->tx.pending[shard][i], &match->list_pending[i]));
-                if ((match->iface_bitmap & (1U << i)) != 0U) {
-                    CANARD_ASSERT(match->cursor[i] == match->head[i]); // must be rewound to the beginning
-                    CANARD_ASSERT(match->cursor[i] != NULL);
-                    enlist_tail(&self->tx.pending[shard][i], &match->list_pending[i]);
-                }
-            }
-            tx_arm_delay_if(self, match);
-        }
-    }
-
-    // Free the memory. The payload memory may already be empty depending on where we were invoked from.
-    txfer_free_payload(tr);
-    mem_free(self->mem.tx_transfer, sizeof(canard_txfer_t), tr);
-
-    // Finally, when the internal state is updated and consistent, invoke the feedback callback if any.
-    if (callback != NULL) {
-        callback(self, fb);
-    }
-}
-
 /// When the queue is exhausted, finds a transfer to sacrifice using simple heuristics and returns it.
 /// Will return NULL if there are no transfers worth sacrificing (no queue space can be reclaimed).
 /// We cannot simply stop accepting new transfers when the queue is full, because it may be caused by a single
@@ -883,19 +887,6 @@ static bool tx_ensure_queue_space(canard_t* const self, const size_t total_frame
         self->err.tx_sacrifice++;
     }
     return total_frames_needed <= (self->tx.queue_capacity - self->tx.queue_size);
-}
-
-static void tx_purge_expired_transfers(canard_t* const self, const canard_us_t now)
-{
-    while (true) { // we can use next_greater instead of doing min search every time
-        canard_txfer_t* const tr = CAVL2_TO_OWNER(cavl2_min(self->tx.index_deadline), canard_txfer_t, index_deadline);
-        if ((tr != NULL) && (now > tr->deadline)) {
-            txfer_retire(self, tr, false);
-            self->err.tx_expiration++;
-        } else {
-            break;
-        }
-    }
 }
 
 static void tx_promote_staged_transfers(canard_t* const self, const canard_us_t now)
@@ -948,9 +939,6 @@ static bool tx_push(canard_t* const            self,
     CANARD_ASSERT((!tr->fd) || !transfer_kind_is_v0(tr->kind)); // The caller must ensure this.
     const canard_us_t now = self->vtable->now(self);
 
-    // Purge expired transfers before accepting a new one to make room in the queue.
-    tx_purge_expired_transfers(self, now);
-
     // Promote staged transfers that are now eligible for retransmission to ensure fairness:
     // if they have the same CAN ID as the new transfer, they should get a chance to go first.
     tx_promote_staged_transfers(self, now);
@@ -991,6 +979,7 @@ static bool tx_push(canard_t* const            self,
     }
 
     // Enqueue for transmission immediately.
+    // TODO: BACKLOG IF NEEDED
     FOREACH_IFACE(i)
     {
         if ((tr->iface_bitmap & (1U << i)) != 0) {
@@ -1006,9 +995,7 @@ static bool tx_push(canard_t* const            self,
     }
 
     // Add to the staged index so that it is repeatedly re-enqueued later until acknowledged or expired.
-    if (tr->reliable) {
-        tx_stage_if(self, tr);
-    }
+    tx_arm_delay_if(self, tr);
 
     // Add to the deadline index for expiration management.
     (void)cavl2_find_or_insert(&self->tx.index_deadline, //
@@ -1043,8 +1030,7 @@ static void tx_receive_ack(canard_t* const self, const uint64_t topic_hash, cons
                     canard_txfer_t,
                     list_oldest,
                     tr, // Backlogged transfers may possibly have conflicting transfer-ID.
-                    (tr->topic_hash == topic_hash) && (tr->remote_transfer_id == transfer_id) &&
-                      !txfer_is_backlogged(tr));
+                    (tr->topic_hash == topic_hash) && (tr->transfer_id == transfer_id) && !txfer_is_backlogged(tr));
     if (tr != NULL) {
         CANARD_ASSERT(txfer_is_reliable(tr) && (tr->topic_hash == topic_hash) && (tr->transfer_id == transfer_id));
         txfer_retire(self, tr, true);
