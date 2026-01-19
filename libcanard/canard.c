@@ -825,10 +825,9 @@ static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const b
                         canard_txfer_t,
                         list_delayed,
                         match,
-                        (match->topic_hash == tr->topic_hash) && (match->delayed_until == HEAT_DEATH));
+                        (match->topic_hash == tr->topic_hash) && txfer_is_backlogged(match));
         if (match != NULL) { // Found a matching topic to promote.
-            CANARD_ASSERT(match->topic_hash == tr->topic_hash);
-            CANARD_ASSERT(match->delayed_until == HEAT_DEATH);
+            CANARD_ASSERT((match->topic_hash == tr->topic_hash) && txfer_is_backlogged(match));
             CANARD_ASSERT((match->iface_bitmap & CANARD_IFACE_COUNT) != 0);
             FOREACH_IFACE(i) // Append to the pending transmission lists for all requested interfaces.
             {
@@ -840,7 +839,6 @@ static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const b
                 }
             }
             tx_arm_delay_if(self, match);
-            CANARD_ASSERT(match->delayed_until < HEAT_DEATH); // either delayed or removed from the delay index
         }
     }
 
