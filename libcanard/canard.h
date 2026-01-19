@@ -218,6 +218,8 @@ typedef struct canard_mem_set_t
     canard_mem_t rx_payload;
 } canard_mem_set_t;
 
+typedef struct canard_txfer_t canard_txfer_t;
+
 typedef struct canard_subscription_t        canard_subscription_t;
 typedef struct canard_subscription_vtable_t canard_subscription_vtable_t;
 struct canard_subscription_vtable_t
@@ -342,15 +344,24 @@ struct canard_t
         /// because UAVCAN v0 does not define CAN FD support.
         bool fd;
 
+        /// Queue size and capacity are measured in CAN frames for convenience, but the TX pipeline actually operates
+        /// on whole transfers for efficiency. The number if enqueued frames is a pretty much synthetic metric for
+        /// convenience, that is derived from the number of enqueued transfers and their sizes.
         size_t queue_capacity;
         size_t queue_size;
 
-        canard_tree_t* index_queue[CANARD_IFACE_COUNT_MAX]; ///< Next to transmit on the left.
-        canard_tree_t* index_staged;                        ///< Soonest retry time on the left.
-        canard_tree_t* index_deadline;                      ///< Soonest deadline on the left.
-        canard_tree_t* index_transfer;                      ///< Ordered by (topic hash, transfer-ID).
-        canard_tree_t* index_transfer_ack;                  ///< Ordered by (remote topic hash, remote transfer-ID).
-        canard_list_t  list_agewise;                        ///< Oldest transfer at the tail.
+        /// Unlike, say, Cyphal/UDP, Cyphal/CAN is unlikely to deal with a large number of high-bandwidth topics
+        /// due to the limited bus capacity; at the same time, CAN is likely to be used with small memory-limited
+        /// devices. Hence we introduce a design tradeoff favoring smaller memory footprint over insertion efficiency,
+        /// which is reasonable on the assumption that the number of simultaneously enqueued transfers (sic! not frames)
+        /// is typically small, on the order of a couple dozen at most.
+        ///
+        /// The structures are optimized to minimize the poll complexity, since it is on the hot path, at the expense
+        /// of insertion and cancellation paths.
+        canard_txfer_t* pending[CANARD_IFACE_COUNT_MAX]; ///< Next to transmit (highest priority) at the head.
+        canard_txfer_t* staged;                          ///< Soonest retry time at the head.
+        canard_txfer_t* oldest_reliable;                 ///< All reliable transfers, oldest at the head.
+        canard_txfer_t* oldest_best_effort;              ///< Ditto for best-effort. Together they list ALL transfers.
     } tx;
 
     struct
@@ -435,10 +446,10 @@ void canard_free(canard_t* const self);
 /// The function must be called asap once any of the interfaces for which there are pending outgoing transfers
 /// become writable, and not less frequently than once in a few milliseconds. The invocation rate defines the
 /// resolution of deadline handling.
-void canard_poll(canard_t* const self, const canard_us_t now, const uint16_t tx_ready_iface_bitmap);
+void canard_poll(canard_t* const self, const canard_us_t now, const uint_least8_t tx_ready_iface_bitmap);
 
 /// Returns a bitmap of interfaces that have pending transmissions. This is useful for IO multiplexing.
-uint16_t canard_pending_ifaces(const canard_t* const self);
+uint_least8_t canard_pending_ifaces(const canard_t* const self);
 
 /// True if successfully processed, false if any of the arguments are invalid.
 /// A malformed frame is not considered an error; it is simply dropped and the corresponding counter is incremented.
@@ -466,7 +477,7 @@ bool canard_unrespond(canard_t* const self, const uint_least8_t destination_node
 bool canard_publish(canard_t* const               self,
                     const canard_us_t             now,
                     const canard_us_t             deadline,
-                    const uint16_t                iface_bitmap,
+                    const uint_least8_t           iface_bitmap,
                     const canard_prio_t           priority,
                     const uint64_t                topic_hash,
                     const uint_least8_t           transfer_id,
@@ -502,7 +513,7 @@ void canard_unsubscribe(canard_t* const self, canard_subscription_t* const subsc
 static inline bool canard_1v0_publish(canard_t* const            self,
                                       const canard_us_t          now,
                                       const canard_us_t          deadline,
-                                      const uint16_t             iface_bitmap,
+                                      const uint_least8_t        iface_bitmap,
                                       const canard_prio_t        priority,
                                       const uint16_t             subject_id,
                                       const uint_least8_t        transfer_id,
@@ -566,7 +577,7 @@ bool canard_1v0_subscribe_response(canard_t* const                           sel
 bool canard_0v1_publish(canard_t* const            self,
                         const canard_us_t          now,
                         const canard_us_t          deadline,
-                        const uint16_t             iface_bitmap,
+                        const uint_least8_t        iface_bitmap,
                         const canard_prio_t        priority,
                         const uint16_t             data_type_id,
                         const uint16_t             crc_seed,
