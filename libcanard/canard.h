@@ -41,8 +41,15 @@ extern "C"
 #define CANARD_CYPHAL_VERSION_MAJOR 1
 #define CANARD_CYPHAL_VERSION_MINOR 1
 
-/// The library supports at most this many local redundant network interfaces.
-#define CANARD_IFACE_COUNT      3U
+/// The library will support at most this many local redundant network interfaces.
+/// This parameter affects the size of several heap-allocated structures.
+/// It is safe to pick any large value but the heap memory footprint will increase accordingly.
+#ifndef CANARD_IFACE_COUNT
+#define CANARD_IFACE_COUNT 2U
+#endif
+#if (CANARD_IFACE_COUNT < 1) || (CANARD_IFACE_COUNT > 8)
+#error "CANARD_IFACE_COUNT must be in the range [1, 8]"
+#endif
 #define CANARD_IFACE_BITMAP_ALL ((1U << CANARD_IFACE_COUNT) - 1U)
 
 /// Parameter ranges are inclusive; the lower bound is zero for all.
@@ -128,6 +135,14 @@ typedef enum canard_prio_t
 } canard_prio_t;
 #define CANARD_PRIO_COUNT 8U
 
+/// This number must not be less than three bits to ensure that the priority field is handled correctly.
+/// Larger values improve list manipulation performance at the cost of some memory footprint.
+/// - 3 bits ensure that each priority level has its own shard, which is the bare minimum.
+/// - 4 bits ensure that messages and RPC-service transfers are separated into dedicated shards.
+/// - 5 bits ensure that messages, requests, and responses are all separated.
+#define CANARD_TX_SHARDING_BITS 4U
+#define CANARD_TX_SHARDS        (1U << CANARD_TX_SHARDING_BITS)
+
 typedef struct canard_tree_t
 {
     struct canard_tree_t* up;
@@ -187,7 +202,7 @@ struct canard_mem_t
 /// The library carries the user-provided context from inputs to outputs without interpreting it,
 /// allowing the application to associate its own data with various entities inside the library.
 /// The size can be changed arbitrarily. This value is compromise between copy size and footprint and utility.
-#define CANARD_USER_CONTEXT_PTR_COUNT 4
+#define CANARD_USER_CONTEXT_PTR_COUNT 2
 typedef union canard_user_context_t
 {
     void*         ptr[CANARD_USER_CONTEXT_PTR_COUNT];
@@ -357,12 +372,14 @@ struct canard_t
         /// is typically small, on the order of a couple dozen at most.
         ///
         /// The structures are optimized to minimize the poll complexity, since it is on the hot path, at the expense
-        /// of insertion and cancellation paths.
-        canard_txfer_t* pending[CANARD_PRIO_COUNT][CANARD_IFACE_COUNT]; ///< Next to transmit at the head.
-        canard_txfer_t* staged[CANARD_PRIO_COUNT];                      ///< Soonest retry time at the head.
-        canard_txfer_t* backlog[CANARD_PRIO_COUNT];                     ///< Oldest at the head.
-        canard_txfer_t* oldest_reliable;                                ///< All reliable transfers, oldest at the head.
-        canard_txfer_t* oldest_best_effort; ///< Ditto for best-effort. Together they list ALL transfers.
+        /// of insertion and cancellation paths. Each pending queue is a simple FIFO; the priority ordering is done
+        /// by having multiple queues, one per TX shard. This does not follow the full CAN ID arbitration order,
+        /// but it is sufficient because the leading sharding bits of the CAN ID provide sufficient selectivity.
+        canard_list_t pending[CANARD_TX_SHARDS][CANARD_IFACE_COUNT]; ///< Next to transmit at the head.
+        canard_list_t staged[CANARD_TX_SHARDS];                      ///< Soonest retry time at the head.
+        canard_list_t backlog[CANARD_TX_SHARDS];                     ///< Oldest at the head.
+        canard_list_t oldest_reliable;                               ///< All reliable transfers, oldest at the head.
+        canard_list_t oldest_best_effort; ///< Ditto for best-effort. Together they list ALL transfers.
     } tx;
 
     struct
