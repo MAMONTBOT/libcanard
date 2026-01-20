@@ -54,7 +54,7 @@ typedef unsigned char byte_t;
 #define PADDING_BYTE_VALUE 0U
 
 #define PRIO_SHIFT 26U
-#define PRIO_MASK  0x7U
+#define PRIO_MASK  7U
 
 /// The MSb of the topic hash is set to this value for P2P transfers to allow distinguishing them from messages.
 /// The LSb contain: (can_id & ((1<<26)-1)) >> 7.
@@ -414,8 +414,8 @@ static canard_us_t tx_ack_timeout(const canard_us_t baseline, const uint32_t can
     return baseline * (1LL << smaller((size_t)prio + (size_t)attempts, 62)); // NOLINT(*-signed-bitwise)
 }
 
-/// On a 32-bit platform, o1heap has a per-block overhead of sizeof(void*)*4=16 bytes, meaning that the available
-/// allocation sizes are 16 bytes (32 byte block), 48 bytes (64 byte block), 112 bytes (128 byte block), etc.
+/// On a 32-bit platform, o1heap has a per-block overhead of sizeof(void*)*2=8 bytes, meaning that the available
+/// allocation sizes are 8 B (16 B block) 24 B (32 B block), 56 B (64 B block), 120 B (128 B block), etc.
 /// Size optimization is very important for Classic CAN because of its low MTU.
 /// Related: https://github.com/OpenCyphal/libcanard/issues/254
 typedef struct tx_frame_t
@@ -425,9 +425,9 @@ typedef struct tx_frame_t
     size_t dlc      : DLC_BITS;                               ///< use canard_len_to_dlc[] and canard_dlc_to_len[]
     byte_t data[];
 } tx_frame_t;
-static_assert((sizeof(void*) > 4) || ((sizeof(tx_frame_t) + CANARD_MTU_CAN_CLASSIC) <= 16),
+static_assert((sizeof(void*) > 4) || ((sizeof(tx_frame_t) + CANARD_MTU_CAN_CLASSIC) <= 24),
               "On a 32-bit platform with a half-fit heap, the full Classic CAN frame should fit in a 32-byte block");
-static_assert((sizeof(void*) > 4) || ((sizeof(tx_frame_t) + CANARD_MTU_CAN_FD) <= 112),
+static_assert((sizeof(void*) > 4) || ((sizeof(tx_frame_t) + CANARD_MTU_CAN_FD) <= 120),
               "On a 32-bit platform with a half-fit heap, the full CAN FD frame should fit in a 128-byte block");
 
 static canard_bytes_t tx_frame_view(const tx_frame_t* const frame)
@@ -523,7 +523,7 @@ struct canard_txfer_t
     canard_user_context_t user_context;
 };
 static_assert((CANARD_IFACE_COUNT > 2) || (sizeof(void*) > 4) || (sizeof(void (*)(void)) > 4) ||
-                (sizeof(canard_txfer_t) <= 112),
+                (sizeof(canard_txfer_t) <= 120),
               "On a 32-bit platform with a half-fit heap, the TX transfer object should fit in a 128-byte block");
 
 static canard_txfer_t* txfer_new(const canard_mem_t          mem,
