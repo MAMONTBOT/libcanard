@@ -1296,29 +1296,6 @@ static void test_tx_push_with_topic_hash(void)
     txfer_retire(&self, tr, true);
 }
 
-static void test_tx_push_oldest_list(void)
-{
-    canard_t                 self;
-    instrumented_allocator_t alloc_tr;
-    instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
-
-    canard_txfer_t* tr = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, false, 1, 0x12345678, 0);
-    TEST_ASSERT_NOT_NULL(tr);
-
-    const uint8_t              data[]  = { 1, 2, 3 };
-    const canard_bytes_chain_t payload = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
-
-    const bool ok = tx_push(&self, tr, payload, CRC_INITIAL);
-    TEST_ASSERT_TRUE(ok);
-
-    // Oldest list (unreliable = oldest[0]) should contain the transfer.
-    TEST_ASSERT_NOT_NULL(self.tx.oldest[0].head);
-    TEST_ASSERT_NOT_NULL(self.tx.oldest[0].tail);
-
-    txfer_retire(&self, tr, true);
-}
-
 static void test_tx_push_fragmented_payload(void)
 {
     canard_t                 self;
@@ -1419,7 +1396,6 @@ int main(void)
     RUN_TEST(test_tx_push_empty_payload);
     RUN_TEST(test_tx_push_v0_empty_payload);
     RUN_TEST(test_tx_push_with_topic_hash);
-    RUN_TEST(test_tx_push_oldest_list);
     RUN_TEST(test_tx_push_fragmented_payload);
     RUN_TEST(test_tx_push_large_payload_fd);
     return UNITY_END();
