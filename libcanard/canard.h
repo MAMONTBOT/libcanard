@@ -144,8 +144,8 @@ typedef enum canard_prio_t
 #ifndef CANARD_TX_SHARDING_BITS
 #define CANARD_TX_SHARDING_BITS 4U
 #endif
-#if (CANARD_TX_SHARDING_BITS < 3) || (CANARD_TX_SHARDING_BITS > 16)
-#error "CANARD_TX_SHARDING_BITS must be in the range [3, 16]"
+#if (CANARD_TX_SHARDING_BITS < 3)
+#error "CANARD_TX_SHARDING_BITS must be at least 3"
 #endif
 #define CANARD_TX_SHARDS (1U << CANARD_TX_SHARDING_BITS)
 
@@ -411,7 +411,7 @@ struct canard_t
         ///
         /// Unlike Cyphal/UDP, we don't have a dedicated deadline index, again to conserve memory. Instead, we do
         /// iterative scanning during poll() by storing the iteration cursors here. They are invalidated as needed.
-        uint16_t      pending_shards_bitmap[CANARD_IFACE_COUNT]; ///< Bit index corresponds to non-empty pending shards.
+        uint32_t      pending_shards_bitmap[CANARD_IFACE_COUNT]; ///< Bit index corresponds to non-empty pending shards.
         canard_list_t pending[CANARD_TX_SHARDS][CANARD_IFACE_COUNT]; ///< Next to transmit at the head.
         canard_list_t delayed[CANARD_TX_SHARDS]; ///< Soonest retry time at the head. HEAT_DEATH if backlogged, at tail.
         canard_list_t oldest[2];                 ///< ALL transfers, oldest at head, sharded by QoS (1=reliable).

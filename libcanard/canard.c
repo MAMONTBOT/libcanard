@@ -448,7 +448,7 @@ static tx_frame_t* tx_frame_new(canard_t* const self, const size_t data_size)
     if (frame != NULL) {
         frame->next     = NULL;
         frame->refcount = 1U;
-        frame->dlc      = canard_len_to_dlc[data_size]; // NOLINT(*-security.ArrayBound)
+        frame->dlc      = canard_len_to_dlc[data_size] & 15U; // NOLINT(*-security.ArrayBound)
         // Update the count; this is decremented when the frame is freed upon refcount reaching zero.
         self->tx.queue_size++;
     }
@@ -968,7 +968,7 @@ static bool tx_push(canard_t* const            self,
     CANARD_ASSERT((self->tx.queue_size - queue_size_before) == n_frames);
     CANARD_ASSERT(self->tx.queue_size <= self->tx.queue_capacity);
     (void)queue_size_before;
-    const size_t frame_refcount_inc = popcount(tr->iface_bitmap) - 1U;
+    const byte_t frame_refcount_inc = (byte_t)(popcount(tr->iface_bitmap) - 1U);
     CANARD_ASSERT(frame_refcount_inc < CANARD_IFACE_COUNT);
     if (frame_refcount_inc > 0) {
         tx_frame_t* frame = spool;
