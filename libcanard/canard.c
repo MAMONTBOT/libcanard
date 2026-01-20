@@ -262,7 +262,7 @@ static void delist(canard_list_t* const list, canard_listed_t* const member)
     }
     member->next = NULL;
     member->prev = NULL;
-    assert((list->head != NULL) == (list->tail != NULL));
+    CANARD_ASSERT((list->head != NULL) == (list->tail != NULL));
 }
 
 /// Insert addendum after anchor. If anchor is NULL, insert at the head.
@@ -270,8 +270,8 @@ static void delist(canard_list_t* const list, canard_listed_t* const member)
 static void enlist_after(canard_list_t* const list, canard_listed_t* const anchor, canard_listed_t* const addendum)
 {
     delist(list, addendum);
-    assert((addendum->next == NULL) && (addendum->prev == NULL));
-    assert((list->head != NULL) == (list->tail != NULL));
+    CANARD_ASSERT((addendum->next == NULL) && (addendum->prev == NULL));
+    CANARD_ASSERT((list->head != NULL) == (list->tail != NULL));
     if (anchor == NULL) {
         addendum->next = list->head;
         if (list->head != NULL) {
@@ -291,7 +291,7 @@ static void enlist_after(canard_list_t* const list, canard_listed_t* const ancho
         }
         anchor->next = addendum;
     }
-    assert((list->head != NULL) && (list->tail != NULL));
+    CANARD_ASSERT((list->head != NULL) && (list->tail != NULL));
 }
 
 /// Insert addendum before anchor. If anchor is NULL, insert at the tail.
@@ -299,8 +299,8 @@ static void enlist_after(canard_list_t* const list, canard_listed_t* const ancho
 static void enlist_before(canard_list_t* const list, canard_listed_t* const anchor, canard_listed_t* const addendum)
 {
     delist(list, addendum);
-    assert((addendum->next == NULL) && (addendum->prev == NULL));
-    assert((list->head != NULL) == (list->tail != NULL));
+    CANARD_ASSERT((addendum->next == NULL) && (addendum->prev == NULL));
+    CANARD_ASSERT((list->head != NULL) == (list->tail != NULL));
     if (anchor == NULL) {
         addendum->prev = list->tail;
         if (list->tail != NULL) {
@@ -320,7 +320,7 @@ static void enlist_before(canard_list_t* const list, canard_listed_t* const anch
         }
         anchor->prev = addendum;
     }
-    assert((list->head != NULL) && (list->tail != NULL));
+    CANARD_ASSERT((list->head != NULL) && (list->tail != NULL));
 }
 
 /// If the item is already in the list, it will be delisted first. Can be used for moving to the front/back.
@@ -422,7 +422,7 @@ typedef struct tx_frame_t
 {
     struct tx_frame_t* next;
     size_t refcount : (sizeof(size_t) * CHAR_BIT) - DLC_BITS; ///< 268+ million ought to be enough for anybody
-    size_t dlc : DLC_BITS;                                    ///< use canard_len_to_dlc[] and canard_dlc_to_len[]
+    size_t dlc      : DLC_BITS;                               ///< use canard_len_to_dlc[] and canard_dlc_to_len[]
     byte_t data[];
 } tx_frame_t;
 static_assert((sizeof(void*) > 4) || ((sizeof(tx_frame_t) + CANARD_MTU_CAN_CLASSIC) <= 16),
