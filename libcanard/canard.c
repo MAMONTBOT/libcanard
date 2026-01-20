@@ -555,12 +555,13 @@ static canard_txfer_t* txfer_new(const canard_mem_t            mem,
         tr->iface_bitmap       = iface_bitmap;
         tr->transfer_id        = transfer_id & CANARD_TRANSFER_ID_MAX;
         tr->remote_transfer_id = tr->transfer_id;
-        tr->kind               = (byte_t)kind;
-        tr->fd                 = fd;
-        tr->can_id             = can_id;
-        tr->deadline           = deadline;
-        tr->topic_hash         = topic_hash;
-        tr->remote_topic_hash  = topic_hash;
+        CANARD_ASSERT(kind < 8);
+        tr->kind              = (byte_t)(kind & 7U);
+        tr->fd                = fd;
+        tr->can_id            = can_id;
+        tr->deadline          = deadline;
+        tr->topic_hash        = topic_hash;
+        tr->remote_topic_hash = topic_hash;
     }
     return tr;
 }
