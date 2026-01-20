@@ -952,7 +952,7 @@ static void test_tx_push_v0_request(void)
 
     // v0 transfer must have fd=false.
     canard_txfer_t* tr =
-      make_test_transfer(self.mem.tx_transfer, transfer_kind_v0_request, false, false, 1, 0xABCDEF00, 15);
+      make_test_transfer(self.mem.tx_transfer, transfer_kind_v0_request, false, false, 1, 0x0BCDEF00, 15);
     TEST_ASSERT_NOT_NULL(tr);
 
     // Single-frame v0: 5 bytes < 8.
@@ -976,7 +976,7 @@ static void test_tx_push_v0_response(void)
 
     // v0 transfer must have fd=false.
     canard_txfer_t* tr =
-      make_test_transfer(self.mem.tx_transfer, transfer_kind_v0_response, false, false, 1, 0xABCDEF00, 31);
+      make_test_transfer(self.mem.tx_transfer, transfer_kind_v0_response, false, false, 1, 0x0BCDEF00, 31);
     TEST_ASSERT_NOT_NULL(tr);
 
     // Multi-frame v0: 20 bytes. 2 CRC + 20 = 22. At 7 bytes/frame => 4 frames.

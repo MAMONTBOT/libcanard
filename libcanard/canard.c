@@ -659,10 +659,12 @@ static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const b
         self->tx.iterator[reliable] = LIST_NEXT(tr, canard_txfer_t, list_oldest); // May be NULL, is OK.
     }
     FOREACH_IFACE (i) {
-        CANARD_ASSERT((self->tx.pending_shards_bitmap[i] & (1U << shard)) != 0U);
-        delist(&self->tx.pending[shard][i], &tr->list_pending[i]);
-        if (self->tx.pending[shard][i].head == NULL) {
-            self->tx.pending_shards_bitmap[i] &= ~(1U << shard);
+        if ((tr->iface_bitmap & (1U << i)) != 0) {
+            CANARD_ASSERT((self->tx.pending_shards_bitmap[i] & (1U << shard)) != 0U);
+            delist(&self->tx.pending[shard][i], &tr->list_pending[i]);
+            if (self->tx.pending[shard][i].head == NULL) {
+                self->tx.pending_shards_bitmap[i] &= ~(1U << shard);
+            }
         }
     }
     delist(&self->tx.oldest[reliable], &tr->list_oldest);
