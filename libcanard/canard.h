@@ -140,7 +140,8 @@ typedef enum canard_prio_t
 /// - 3 bits ensure that each priority level has its own shard, which is the bare minimum.
 /// - 4 bits ensure that messages and RPC-service transfers are separated into dedicated shards. Recommended choice.
 /// - 5 bits ensure that messages, requests, and responses are all separated. Good for higher-bandwidth applications.
-/// - Very high-throughput nodes (large MCUs or non-deeply-embedded systems) can go up to 8 bits and possibly beyond.
+/// - 6 bits might be appropriate for some very high-bandwidth large applications with many simultaneous transfers.
+/// Going beyond 6 bits is unlikely to be a sensible idea because it will require scanning >=128 shards on every poll.
 #ifndef CANARD_TX_SHARDING_BITS
 #define CANARD_TX_SHARDING_BITS 4U
 #endif
