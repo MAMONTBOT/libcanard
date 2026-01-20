@@ -976,43 +976,60 @@ static bool tx_push(canard_t* const            self,
         }
     }
 
-    // Enqueue for transmission immediately.
-    // TODO: BACKLOG IF NEEDED
+    // Insert into the oldest list.
+    const bool reliable = txfer_is_reliable(tr);
+    enlist_tail(&self->tx.oldest[reliable], &tr->list_oldest);
+
+    // We need to ensure that transfers emitted at the same priority level are send strictly in push order.
+    // For best-effort transfers this is trivial as all we need to do is to enqueue them as-is.
+    // Reliable transfers, however, break this order because they may be retransmitted multiple times, and if any
+    // other transfer (any QoS) is enqueued while at least one reliable transfer is pending, reordering may result,
+    // because the pending reliable transfer may retransmit, breaking the transfer ordering seen on the wire.
+    //
+    // Thus, before we enqueue, we need to check if there are any reliable transfers on the same priority shard
+    // and same topic pending for transmission or waiting for a retransmission; if there are, the new transfer
+    // goes into the backlog, where it will wait until the transfer ahead of it is either successfully delivered
+    // or timed out.
+    //
+    // If there are no such transfers, it can be enqueued immediately; observe that there may still be some reliable
+    // transfers waiting for ack, but if such transfers are neither pending nor delayed, it means that they have
+    // completed the last transmission attempt, no further attempts will be made, and thus no reordering can occur.
+    const byte_t shard                  = txfer_shard(tr);
+    bool         has_preceding_reliable = false;
     FOREACH_IFACE (i) {
-        if ((tr->iface_bitmap & (1U << i)) != 0) {
-            const tx_cavl_compare_can_id_user_t user = { .can_id = tr->can_id, .iface_index = (byte_t)i };
-            (void)cavl2_find_or_insert(&self->tx.index_queue[i], //
-                                       &user,
-                                       tx_cavl_compare_queue,
-                                       &tr->index_queue[i],
-                                       cavl2_trivial_factory);
-            tr->head[i]   = spool;
-            tr->cursor[i] = spool;
+        LIST_FIND_FIRST(self->tx.pending[shard][i],
+                        canard_txfer_t,
+                        list_pending[i], // check if this is standard-compliant
+                        match,
+                        (match->topic_hash == tr->topic_hash) && txfer_is_reliable(match));
+        if (match != NULL) {
+            has_preceding_reliable = true;
+            break;
         }
     }
+    if (!has_preceding_reliable) {
+        LIST_FIND_FIRST(self->tx.delayed[shard],
+                        canard_txfer_t,
+                        list_delayed,
+                        match,
+                        (match->topic_hash == tr->topic_hash) && txfer_is_reliable(match));
+        has_preceding_reliable = (match != NULL);
+    }
 
-    // Add to the staged index so that it is repeatedly re-enqueued later until acknowledged or expired.
-    tx_arm_delay_if(self, tr);
-
-    // Add to the deadline index for expiration management.
-    (void)cavl2_find_or_insert(&self->tx.index_deadline, //
-                               &tr->deadline,
-                               tx_cavl_compare_deadline,
-                               &tr->index_deadline,
-                               cavl2_trivial_factory);
-
-    // Add to the transfer index for incoming ack management and transfer-ID reuse detection.
-    const txfer_key_t          key           = { .topic_hash = tr->topic_hash, .transfer_id = tr->transfer_id };
-    const canard_tree_t* const tree_transfer = cavl2_find_or_insert(&self->tx.index_transfer, //
-                                                                    &key,
-                                                                    tx_cavl_compare_transfer,
-                                                                    &tr->index_transfer,
-                                                                    cavl2_trivial_factory);
-    CANARD_ASSERT(tree_transfer == &tr->index_transfer); // ensure no duplicates; checked at the API level
-    (void)tree_transfer;
-
-    // Add to the agewise list for sacrifice management on queue exhaustion. The oldest transfer will be at the tail.
-    enlist_head(&self->tx.list_agewise, &tr->list_agewise);
+    // Schedule for transmission or backlog depending on the findings above.
+    if (has_preceding_reliable) { // into the backlog you go, buddy
+        tr->delayed_until = HEAT_DEATH;
+        enlist_tail(&self->tx.delayed[shard], &tr->list_delayed); // FIFO, newest at the tail.
+    } else {
+        FOREACH_IFACE (i) {
+            if ((tr->iface_bitmap & (1U << i)) != 0) {
+                tr->head[i]   = spool;
+                tr->cursor[i] = spool;
+                enlist_tail(&self->tx.pending[shard][i], &tr->list_pending[i]);
+            }
+        }
+        tx_arm_delay_if(self, tr); // Ensure it is repeatedly re-enqueued later until acknowledged or expired.
+    }
     return true;
 }
 
