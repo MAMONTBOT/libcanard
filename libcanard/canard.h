@@ -140,13 +140,12 @@ typedef enum canard_prio_t
 /// - 3 bits ensure that each priority level has its own shard, which is the bare minimum.
 /// - 4 bits ensure that messages and RPC-service transfers are separated into dedicated shards. Recommended choice.
 /// - 5 bits ensure that messages, requests, and responses are all separated. Good for higher-bandwidth applications.
-/// - 6 bits *might* be appropriate for some very high-bandwidth applications with many simultaneous transfers.
-/// Going beyond 6 bits is unlikely to be a sensible idea because it will require scanning >=128 shards on every poll.
+/// - More shard bits may be appropriate for some very high-bandwidth applications with many simultaneous transfers.
 #ifndef CANARD_TX_SHARDING_BITS
 #define CANARD_TX_SHARDING_BITS 4U
 #endif
-#if CANARD_TX_SHARDING_BITS < 3
-#error "CANARD_TX_SHARDING_BITS must be at least 3"
+#if (CANARD_TX_SHARDING_BITS < 3) || (CANARD_TX_SHARDING_BITS > 16)
+#error "CANARD_TX_SHARDING_BITS must be in the range [3, 16]"
 #endif
 #define CANARD_TX_SHARDS (1U << CANARD_TX_SHARDING_BITS)
 
@@ -319,6 +318,18 @@ typedef struct canard_vtable_t
                uint32_t       extended_can_id,
                canard_bytes_t can_data);
 
+    /// Notification about the outcome of a reliable transfer previously submitted for transmission.
+    /// This is always invoked for reliable transfers either at successful delivery or at deadline expiration.
+    /// This is not used with best-effort transfers.
+    ///
+    /// The number of remote nodes that acknowledged the reception of the transfer is provided.
+    /// For P2P transfers, this value is either 0 (failure) or 1 (success).
+    void (*feedback)(canard_t*,
+                     canard_user_context_t,
+                     uint64_t      topic_hash,
+                     uint_least8_t transfer_id,
+                     uint_least8_t acknowledgements);
+
     /// Invoked immediately before tx() to obtain the subject-ID for the given transfer.
     /// The application is expected to rely on the user context to access the topic context for subject-ID derivation.
     /// This is the same user context that was passed to canard_publish().
@@ -395,9 +406,12 @@ struct canard_t
         /// The shards are based on the most significant bits of the CAN ID, meaning that the lowest index shard
         /// has the highest arbitration priority and should be chosen for transmission first. There is no ordering
         /// preservation guarantee between priority levels (obviously) so they all are treated as independent lists.
+        /// The pending shards bitmap is used for O(1) fetching of the highes-priority non-empty shard during poll()
+        /// -- no scanning needed.
         ///
         /// Unlike Cyphal/UDP, we don't have a dedicated deadline index, again to conserve memory. Instead, we do
         /// iterative scanning during poll() by storing the iteration cursors here. They are invalidated as needed.
+        uint16_t      pending_shards_bitmap[CANARD_IFACE_COUNT]; ///< Bit index corresponds to non-empty pending shards.
         canard_list_t pending[CANARD_TX_SHARDS][CANARD_IFACE_COUNT]; ///< Next to transmit at the head.
         canard_list_t delayed[CANARD_TX_SHARDS]; ///< Soonest retry time at the head. HEAT_DEATH if backlogged, at tail.
         canard_list_t oldest[2];                 ///< ALL transfers, oldest at head, sharded by QoS (1=reliable).
@@ -435,20 +449,6 @@ struct canard_t
 
     const canard_vtable_t* vtable;
 };
-
-/// Notification about the outcome of a reliable transfer previously submitted for transmission.
-typedef struct canard_tx_feedback_t
-{
-    uint64_t      topic_hash;
-    uint_least8_t transfer_id;
-
-    /// The number of remote nodes that acknowledged the reception of the transfer.
-    /// For P2P transfers, this value is either 0 (failure) or 1 (success).
-    uint_least8_t acknowledgements;
-
-    canard_user_context_t user_context;
-} canard_tx_feedback_t;
-typedef void (*canard_on_tx_feedback_t)(canard_t*, canard_tx_feedback_t);
 
 /// The TX queue is shared between all redundant interfaces with deduplication (each frame is enqueued only once).
 /// The capacity set here is therefore the total capacity across all interfaces.
@@ -502,7 +502,7 @@ bool canard_ingest_frame(canard_t* const      self,
                          const canard_bytes_t can_data);
 
 void canard_refcount_inc(const canard_bytes_t obj);
-void canard_refcount_dec(const canard_bytes_t obj);
+void canard_refcount_dec(canard_t* const self, const canard_bytes_t obj);
 
 /// Cancel a pending outgoing message transfer on a subject, or an outgoing P2P transfer to a node.
 /// Returns true if a transfer was found and cancelled, false if no such transfer was found.
@@ -515,25 +515,25 @@ bool canard_unrespond(canard_t* const self, const uint_least8_t destination_node
 /// The application is expected to rely on the user context to access the topic context for subject-ID derivation
 /// (e.g., store a topic pointer in there).
 /// Pinned subject-IDs equal the topic hash and as such do not require postponed resolution.
-bool canard_publish(canard_t* const               self,
-                    const canard_us_t             deadline,
-                    const uint_least8_t           iface_bitmap,
-                    const canard_prio_t           priority,
-                    const uint64_t                topic_hash,
-                    const uint_least8_t           transfer_id,
-                    const canard_bytes_chain_t    payload,
-                    const canard_user_context_t   context,
-                    const canard_on_tx_feedback_t feedback);
+bool canard_publish(canard_t* const             self,
+                    const canard_us_t           deadline,
+                    const uint_least8_t         iface_bitmap,
+                    const canard_prio_t         priority,
+                    const uint64_t              topic_hash,
+                    const uint_least8_t         transfer_id,
+                    const canard_bytes_chain_t  payload,
+                    const canard_user_context_t context,
+                    const bool                  reliable);
 
-bool canard_respond(canard_t* const               self,
-                    const canard_us_t             deadline,
-                    const uint_least8_t           destination_node_id,
-                    const canard_prio_t           priority,
-                    const uint64_t                request_topic_hash,
-                    const uint_least8_t           request_transfer_id,
-                    const canard_bytes_chain_t    payload,
-                    const canard_user_context_t   context,
-                    const canard_on_tx_feedback_t feedback);
+bool canard_respond(canard_t* const             self,
+                    const canard_us_t           deadline,
+                    const uint_least8_t         destination_node_id,
+                    const canard_prio_t         priority,
+                    const uint64_t              request_topic_hash,
+                    const uint_least8_t         request_transfer_id,
+                    const canard_bytes_chain_t  payload,
+                    const canard_user_context_t context,
+                    const bool                  reliable);
 
 bool canard_subscribe(canard_t* const                           self,
                       canard_subscription_t* const              subscription,
@@ -565,7 +565,7 @@ static inline bool canard_1v0_publish(canard_t* const            self,
                                                                        transfer_id,
                                                                        payload,
                                                                        CANARD_USER_CONTEXT_NULL,
-                                                                       NULL);
+                                                                       false);
 }
 
 bool canard_1v0_request(canard_t* const            self,

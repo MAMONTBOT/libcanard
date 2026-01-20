@@ -5,6 +5,7 @@
 
 #include "canard.h"
 #include <assert.h>
+#include <limits.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -87,6 +88,8 @@ static bool transfer_kind_is_v0(const transfer_kind_t kind)
            (kind == transfer_kind_v0_request) || //
            (kind == transfer_kind_v0_response);
 }
+
+#define DLC_BITS 4U
 
 const uint_least8_t canard_dlc_to_len[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64 };
 const uint_least8_t canard_len_to_dlc[65] = {
@@ -411,23 +414,25 @@ static canard_us_t tx_ack_timeout(const canard_us_t baseline, const uint32_t can
     return baseline * (1LL << smaller((size_t)prio + (size_t)attempts, 62)); // NOLINT(*-signed-bitwise)
 }
 
+/// On a 32-bit platform, o1heap has a per-block overhead of sizeof(void*)*4=16 bytes, meaning that the available
+/// allocation sizes are 16 bytes (32 byte block), 48 bytes (64 byte block), 112 bytes (128 byte block), etc.
+/// Size optimization is very important for Classic CAN because of its low MTU.
+/// Related: https://github.com/OpenCyphal/libcanard/issues/254
 typedef struct tx_frame_t
 {
-    size_t             refcount;
-    size_t*            objcount;
-    canard_mem_t       mem;
     struct tx_frame_t* next;
-    size_t             size;
-    byte_t             data[];
+    size_t refcount : (sizeof(size_t) * CHAR_BIT) - DLC_BITS; ///< 268+ million ought to be enough for anybody
+    size_t dlc      : DLC_BITS;                               ///< use canard_len_to_dlc[] and canard_dlc_to_len[]
+    byte_t data[];
 } tx_frame_t;
-static_assert((sizeof(void*) > 4) || ((sizeof(tx_frame_t) + CANARD_MTU_CAN_CLASSIC) <= 48),
-              "On a 32-bit platform with a half-fit heap, the full Classic CAN frame should fit in a 64-byte block");
+static_assert((sizeof(void*) > 4) || ((sizeof(tx_frame_t) + CANARD_MTU_CAN_CLASSIC) <= 16),
+              "On a 32-bit platform with a half-fit heap, the full Classic CAN frame should fit in a 32-byte block");
 static_assert((sizeof(void*) > 4) || ((sizeof(tx_frame_t) + CANARD_MTU_CAN_FD) <= 112),
               "On a 32-bit platform with a half-fit heap, the full CAN FD frame should fit in a 128-byte block");
 
 static canard_bytes_t tx_frame_view(const tx_frame_t* const frame)
 {
-    return (canard_bytes_t){ .size = frame->size, .data = frame->data };
+    return (canard_bytes_t){ .size = canard_dlc_to_len[frame->dlc], .data = frame->data };
 }
 
 static tx_frame_t* tx_frame_from_view(const canard_bytes_t view)
@@ -435,19 +440,17 @@ static tx_frame_t* tx_frame_from_view(const canard_bytes_t view)
     return (tx_frame_t*)ptr_unbias(view.data, offsetof(tx_frame_t, data));
 }
 
-static tx_frame_t* tx_frame_new(const canard_mem_t mem, size_t* const queue_size, const size_t data_size)
+static tx_frame_t* tx_frame_new(canard_t* const self, const size_t data_size)
 {
     CANARD_ASSERT(data_size <= CANARD_MTU_CAN_FD);
     CANARD_ASSERT(data_size == canard_dlc_to_len[canard_len_to_dlc[data_size]]); // NOLINT(*-security.ArrayBound)
-    tx_frame_t* const frame = (tx_frame_t*)mem_alloc(mem, sizeof(tx_frame_t) + data_size);
+    tx_frame_t* const frame = (tx_frame_t*)mem_alloc(self->mem.tx_frame, sizeof(tx_frame_t) + data_size);
     if (frame != NULL) {
-        frame->refcount = 1U;
-        frame->objcount = queue_size;
-        frame->mem      = mem;
         frame->next     = NULL;
-        frame->size     = data_size;
+        frame->refcount = 1U;
+        frame->dlc      = canard_len_to_dlc[data_size]; // NOLINT(*-security.ArrayBound)
         // Update the count; this is decremented when the frame is freed upon refcount reaching zero.
-        ++*queue_size;
+        self->tx.queue_size++;
     }
     return frame;
 }
@@ -461,16 +464,17 @@ void canard_refcount_inc(const canard_bytes_t obj)
     }
 }
 
-void canard_refcount_dec(const canard_bytes_t obj)
+void canard_refcount_dec(canard_t* const self, const canard_bytes_t obj)
 {
     if (obj.data != NULL) {
         tx_frame_t* const frame = tx_frame_from_view(obj);
         CANARD_ASSERT(frame->refcount > 0U); // NOLINT(*-security.ArrayBound)
-        --frame->refcount;                   // TODO: if C11 is enabled, use stdatomic here
+        CANARD_ASSERT(canard_dlc_to_len[frame->dlc] == obj.size);
+        frame->refcount--;
         if (frame->refcount == 0U) {
-            CANARD_ASSERT(*frame->objcount > 0U);
-            --*frame->objcount;
-            mem_free(frame->mem, sizeof(tx_frame_t) + frame->size, frame);
+            CANARD_ASSERT(self->tx.queue_size > 0U);
+            self->tx.queue_size--;
+            mem_free(self->mem.tx_frame, sizeof(tx_frame_t) + obj.size, frame);
         }
     }
 }
@@ -488,10 +492,6 @@ struct canard_txfer_t
     canard_listed_t list_delayed;
     canard_listed_t list_oldest;
 
-    /// Application closure.
-    canard_on_tx_feedback_t feedback; ///< NULL if best-effort, otherwise reliable.
-    canard_user_context_t   user_context;
-
     /// Mutable transmission state. All other fields, except for the index handles, are immutable.
     ///
     /// We always keep a pointer to the head of the spool, plus a cursor that scans the frames during transmission.
@@ -500,8 +500,8 @@ struct canard_txfer_t
     /// in which case the old head is dereferenced and the head points to the next frame to transmit.
     tx_frame_t* head[CANARD_IFACE_COUNT];
     tx_frame_t* cursor[CANARD_IFACE_COUNT];
-    byte_t      epoch;         ///< No overflow due to exponential backoff; e.g. 1us @ epoch=48 => 9 years.
     canard_us_t delayed_until; ///< When the transfer becomes eligible for retransmission. HEAT_DEATH if backlogged.
+    byte_t      epoch;         ///< No overflow due to exponential backoff; e.g. 1us @ epoch=48 => 9 years.
 
     /// Constant transfer properties supplied by the client.
     /// The remote_* fields are identical to the local ones except in the case of P2P transfers, where
@@ -509,28 +509,33 @@ struct canard_txfer_t
     /// and to report the correct values via the feedback callback for P2P transfers.
     /// By default, upon construction, the remote_* fields equal the local ones, which is valid for ordinary messages.
     byte_t      iface_bitmap; ///< Guaranteed to have at least one bit set within CANARD_IFACE_COUNT.
-    byte_t      transfer_id;
-    byte_t      remote_transfer_id;
-    byte_t      kind : 3; ///< transfer_kind_t
-    byte_t      fd   : 1;
+    byte_t      transfer_id        : 5;
+    byte_t      kind               : 3; ///< transfer_kind_t
+    byte_t      remote_transfer_id : 5;
+    byte_t      fd                 : 1;
+    byte_t      reliable           : 1;
     uint32_t    can_id; ///< For v1.1 messages, the subject-ID bits are zeroed. Node-ID is always zeroed.
     uint64_t    topic_hash;
     uint64_t    remote_topic_hash;
     canard_us_t deadline;
+
+    /// Application context.
+    canard_user_context_t user_context;
 };
-static_assert((CANARD_IFACE_COUNT > 2) || (sizeof(void*) > 4) || (sizeof(canard_txfer_t) <= 112),
+static_assert((CANARD_IFACE_COUNT > 2) || (sizeof(void*) > 4) || (sizeof(void (*)(void)) > 4) ||
+                (sizeof(canard_txfer_t) <= 112),
               "On a 32-bit platform with a half-fit heap, the TX transfer object should fit in a 128-byte block");
 
-static canard_txfer_t* txfer_new(const canard_mem_t            mem,
-                                 const canard_us_t             deadline,
-                                 const uint_least8_t           iface_bitmap,
-                                 const uint32_t                can_id,
-                                 const byte_t                  transfer_id,
-                                 const bool                    fd,
-                                 const transfer_kind_t         kind,
-                                 const uint64_t                topic_hash,
-                                 const canard_user_context_t   user_context,
-                                 const canard_on_tx_feedback_t feedback)
+static canard_txfer_t* txfer_new(const canard_mem_t          mem,
+                                 const canard_us_t           deadline,
+                                 const uint_least8_t         iface_bitmap,
+                                 const uint32_t              can_id,
+                                 const byte_t                transfer_id,
+                                 const bool                  fd,
+                                 const transfer_kind_t       kind,
+                                 const uint64_t              topic_hash,
+                                 const canard_user_context_t user_context,
+                                 const bool                  reliable)
 {
     CANARD_ASSERT(can_id <= CAN_EXT_ID_MASK);
     CANARD_ASSERT((iface_bitmap & CANARD_IFACE_BITMAP_ALL) != 0);
@@ -542,9 +547,6 @@ static canard_txfer_t* txfer_new(const canard_mem_t            mem,
         }
         tr->list_delayed = LIST_NULL;
         tr->list_oldest  = LIST_NULL;
-        //
-        tr->feedback     = feedback;
-        tr->user_context = user_context;
         //
         FOREACH_IFACE (i) {
             tr->head[i] = tr->cursor[i] = NULL;
@@ -558,10 +560,13 @@ static canard_txfer_t* txfer_new(const canard_mem_t            mem,
         CANARD_ASSERT(kind < 8);
         tr->kind              = (byte_t)(kind & 7U);
         tr->fd                = fd;
+        tr->reliable          = reliable;
         tr->can_id            = can_id;
         tr->deadline          = deadline;
         tr->topic_hash        = topic_hash;
         tr->remote_topic_hash = topic_hash;
+        //
+        tr->user_context = user_context;
     }
     return tr;
 }
@@ -571,17 +576,16 @@ static byte_t txfer_shard(const canard_txfer_t* const tr)
     return (byte_t)((tr->can_id >> (29U - CANARD_TX_SHARDING_BITS)) & ((1U << CANARD_TX_SHARDING_BITS) - 1U));
 }
 
-static bool txfer_is_reliable(const canard_txfer_t* const tr) { return tr->feedback != NULL; }
 static bool txfer_is_backlogged(const canard_txfer_t* const tr) { return tr->delayed_until == HEAT_DEATH; }
 
-static void txfer_free_payload(canard_txfer_t* const tr)
+static void txfer_free_payload(canard_t* const self, canard_txfer_t* const tr)
 {
     CANARD_ASSERT(tr != NULL);
     FOREACH_IFACE (i) {
         const tx_frame_t* frame = tr->head[i];
         while (frame != NULL) {
             const tx_frame_t* const next = frame->next;
-            canard_refcount_dec(tx_frame_view(frame));
+            canard_refcount_dec(self, tx_frame_view(frame));
             frame = next;
         }
         tr->head[i]   = NULL;
@@ -599,7 +603,7 @@ static void txfer_free_payload(canard_txfer_t* const tr)
 static void tx_arm_delay_if(canard_t* const self, canard_txfer_t* const tr)
 {
     const byte_t shard = txfer_shard(tr);
-    if (!txfer_is_reliable(tr)) {
+    if (!tr->reliable) {
         delist(&self->tx.delayed[shard], &tr->list_delayed);
         tr->delayed_until = BIG_BANG;
     } else {
@@ -643,21 +647,23 @@ static void tx_arm_delay_if(canard_t* const self, canard_txfer_t* const tr)
 /// where pub/sub associations are established and removed automatically, transparently to the application.
 static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const bool success)
 {
-    const canard_tx_feedback_t    fb         = { .topic_hash       = tr->remote_topic_hash,
-                                                 .transfer_id      = tr->remote_transfer_id,
-                                                 .acknowledgements = success ? 1 : 0,
-                                                 .user_context     = tr->user_context };
-    const canard_on_tx_feedback_t callback   = tr->feedback;
-    const byte_t                  shard      = txfer_shard(tr);
-    const bool                    reliable   = txfer_is_reliable(tr);
-    const bool                    backlogged = txfer_is_backlogged(tr);
+    const uint64_t              topic_hash   = tr->remote_topic_hash;
+    const byte_t                transfer_id  = tr->remote_transfer_id;
+    const canard_user_context_t user_context = tr->user_context;
+    const byte_t                shard        = txfer_shard(tr);
+    const bool                  reliable     = tr->reliable;
+    const bool                  backlogged   = txfer_is_backlogged(tr);
 
     // Delist everywhere. Remember that delisting a non-listed entity is a safe no-op.
     if (self->tx.iterator[reliable] == tr) {
         self->tx.iterator[reliable] = LIST_NEXT(tr, canard_txfer_t, list_oldest); // May be NULL, is OK.
     }
-    for (byte_t i = 0; i < CANARD_IFACE_COUNT; i++) {
+    FOREACH_IFACE (i) {
+        CANARD_ASSERT((self->tx.pending_shards_bitmap[i] & (1U << shard)) != 0U);
         delist(&self->tx.pending[shard][i], &tr->list_pending[i]);
+        if (self->tx.pending[shard][i].head == NULL) {
+            self->tx.pending_shards_bitmap[i] &= ~(1U << shard);
+        }
     }
     delist(&self->tx.oldest[reliable], &tr->list_oldest);
     delist(&self->tx.delayed[shard], &tr->list_delayed);
@@ -682,6 +688,7 @@ static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const b
                     CANARD_ASSERT(match->cursor[i] == match->head[i]); // must be rewound to the beginning
                     CANARD_ASSERT(match->cursor[i] != NULL);
                     enlist_tail(&self->tx.pending[shard][i], &match->list_pending[i]);
+                    self->tx.pending_shards_bitmap[i] |= (1U << shard);
                 }
             }
             tx_arm_delay_if(self, match);
@@ -689,12 +696,12 @@ static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const b
     }
 
     // Free the memory. The payload memory may already be empty depending on where we were invoked from.
-    txfer_free_payload(tr);
+    txfer_free_payload(self, tr);
     mem_free(self->mem.tx_transfer, sizeof(canard_txfer_t), tr);
 
     // Finally, when the internal state is updated and consistent, invoke the feedback callback if any.
-    if (callback != NULL) {
-        callback(self, fb);
+    if (tr->reliable) {
+        self->vtable->feedback(self, user_context, topic_hash, transfer_id, success ? 1 : 0);
     }
 }
 
@@ -713,21 +720,19 @@ static size_t tx_ceil_frame_payload_size(const size_t x)
 
 /// Builds a chain of tx_frame_t instances, or NULL if OOM.
 /// This version works with Cyphal/CAN transfers. Legacy transfers require a different layout, see dedicated function.
-static tx_frame_t* tx_spool(const canard_mem_t         mem,
-                            size_t* const              queue_size,
+static tx_frame_t* tx_spool(canard_t* const            self,
                             const uint16_t             crc_seed,
                             const size_t               mtu,
                             const byte_t               transfer_id,
                             const canard_bytes_chain_t payload)
 {
-    CANARD_ASSERT(queue_size != NULL);
     bytes_chain_reader_t reader = { .cursor = &payload, .position = 0U };
     tx_frame_t*          head   = NULL;
     const size_t         size   = bytes_chain_size(payload);
     bool                 toggle = true; // Cyphal transfers start with toggle==1, unlike legacy
     if (size < mtu) {                   // Single-frame transfer; no CRC required -- easy case.
         const size_t frame_size = tx_ceil_frame_payload_size(size + 1U);
-        head                    = tx_frame_new(mem, queue_size, frame_size);
+        head                    = tx_frame_new(self, frame_size);
         if (head != NULL) {
             bytes_chain_read(&reader, size, head->data);
             // NOLINTNEXTLINE(*-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
@@ -744,7 +749,7 @@ static tx_frame_t* tx_spool(const canard_mem_t         mem,
               ((size_with_crc - offset) < (mtu - 1U))
                 ? tx_ceil_frame_payload_size((size_with_crc - offset) + 1U) // padding last frame only
                 : mtu;
-            tx_frame_t* const item = tx_frame_new(mem, queue_size, frame_size_with_tail);
+            tx_frame_t* const item = tx_frame_new(self, frame_size_with_tail);
             if (NULL == head) {
                 head = item;
             } else {
@@ -755,7 +760,7 @@ static tx_frame_t* tx_spool(const canard_mem_t         mem,
             if (NULL == tail) {
                 while (head != NULL) {
                     tx_frame_t* const next = head->next;
-                    canard_refcount_dec(tx_frame_view(head));
+                    canard_refcount_dec(self, tx_frame_view(head));
                     head = next;
                 }
                 break;
@@ -791,7 +796,7 @@ static tx_frame_t* tx_spool(const canard_mem_t         mem,
                 }
             }
             // Finalize the frame.
-            CANARD_ASSERT((frame_offset + 1U) == tail->size);
+            CANARD_ASSERT((frame_offset + 1U) == canard_dlc_to_len[tail->dlc]);
             tail->data[frame_offset] = tx_make_tail_byte(head == tail, offset >= size_with_crc, toggle, transfer_id);
             toggle                   = !toggle;
         }
@@ -801,17 +806,15 @@ static tx_frame_t* tx_spool(const canard_mem_t         mem,
 
 /// The legacy counterpart of tx_spool() for UAVCAN v0 transfers.
 /// Always uses Classic CAN MTU because UAVCAN v0 does not support CAN FD.
-static tx_frame_t* tx_spool_v0(const canard_mem_t         mem,
-                               size_t* const              queue_size,
+static tx_frame_t* tx_spool_v0(canard_t* const            self,
                                const uint16_t             crc_seed,
                                const byte_t               transfer_id,
                                const canard_bytes_chain_t payload)
 {
-    CANARD_ASSERT(queue_size != NULL);
     bool         toggle = false; // in v0, toggle starts with zero; that's how v0/v1 can be distinguished
     const size_t size   = bytes_chain_size(payload);
     if (size < CANARD_MTU_CAN_CLASSIC) { // single-frame transfer
-        tx_frame_t* const item = tx_frame_new(mem, queue_size, size + 1U);
+        tx_frame_t* const item = tx_frame_new(self, size + 1U);
         if (item != NULL) {
             bytes_chain_reader_t reader = { .cursor = &payload, .position = 0U };
             bytes_chain_read(&reader, size, item->data);
@@ -830,8 +833,7 @@ static tx_frame_t* tx_spool_v0(const canard_mem_t         mem,
     tx_frame_t*                tail                      = NULL;
     size_t                     offset                    = 0U;
     while (offset < size_total) {
-        tx_frame_t* const item =
-          tx_frame_new(mem, queue_size, smaller((size_total - offset) + 1U, CANARD_MTU_CAN_CLASSIC));
+        tx_frame_t* const item = tx_frame_new(self, smaller((size_total - offset) + 1U, CANARD_MTU_CAN_CLASSIC));
         if (NULL == head) {
             head = item;
         } else {
@@ -842,16 +844,16 @@ static tx_frame_t* tx_spool_v0(const canard_mem_t         mem,
         if (NULL == tail) {
             while (head != NULL) {
                 tx_frame_t* const next = head->next;
-                canard_refcount_dec(tx_frame_view(head));
+                canard_refcount_dec(self, tx_frame_view(head));
                 head = next;
             }
             break;
         }
         // Populate the frame contents.
-        const size_t progress = smaller(size_total - offset, tail->size - 1U);
+        const size_t progress = smaller(size_total - offset, canard_dlc_to_len[tail->dlc] - 1U);
         bytes_chain_read(&reader, progress, tail->data);
         offset += progress;
-        CANARD_ASSERT((progress + 1U) == tail->size);
+        CANARD_ASSERT((progress + 1U) == canard_dlc_to_len[tail->dlc]);
         CANARD_ASSERT(offset <= size_total);
         tail->data[progress] = tx_make_tail_byte(head == tail, offset == size_total, toggle, transfer_id);
         toggle               = !toggle;
@@ -908,6 +910,7 @@ static void tx_promote_delayed(canard_t* const self, const canard_us_t now)
                         CANARD_ASSERT(tr->head[i] != NULL);          // cannot stage without payload, doesn't make sense
                         CANARD_ASSERT(tr->cursor[i] == tr->head[i]); // must have been rewound after last attempt
                         enlist_tail(&self->tx.pending[shard][i], &tr->list_pending[i]);
+                        self->tx.pending_shards_bitmap[i] |= (1U << shard);
                     }
                 }
             } else {
@@ -955,10 +958,8 @@ static bool tx_push(canard_t* const            self,
 
     // Make a shared frame spool. Unlike the Cyphal/UDP implementation, we require all ifaces to use the same MTU.
     const size_t      queue_size_before = self->tx.queue_size;
-    tx_frame_t* const spool =
-      transfer_kind_is_v0(tr->kind)
-        ? tx_spool_v0(self->mem.tx_frame, &self->tx.queue_size, crc_seed, tr->transfer_id, payload)
-        : tx_spool(self->mem.tx_frame, &self->tx.queue_size, crc_seed, mtu, tr->transfer_id, payload);
+    tx_frame_t* const spool = transfer_kind_is_v0(tr->kind) ? tx_spool_v0(self, crc_seed, tr->transfer_id, payload)
+                                                            : tx_spool(self, crc_seed, mtu, tr->transfer_id, payload);
     if (spool == NULL) {
         mem_free(self->mem.tx_transfer, sizeof(canard_txfer_t), tr);
         self->err.oom++;
@@ -978,8 +979,7 @@ static bool tx_push(canard_t* const            self,
     }
 
     // Insert into the oldest list.
-    const bool reliable = txfer_is_reliable(tr);
-    enlist_tail(&self->tx.oldest[reliable], &tr->list_oldest);
+    enlist_tail(&self->tx.oldest[tr->reliable], &tr->list_oldest);
 
     // We need to ensure that transfers emitted at the same priority level are send strictly in push order.
     // For best-effort transfers this is trivial as all we need to do is to enqueue them as-is.
@@ -1002,7 +1002,7 @@ static bool tx_push(canard_t* const            self,
                         canard_txfer_t,
                         list_pending[i], // check if this is standard-compliant
                         match,
-                        (match->topic_hash == tr->topic_hash) && txfer_is_reliable(match));
+                        (match->topic_hash == tr->topic_hash) && match->reliable);
         if (match != NULL) {
             has_preceding_reliable = true;
             break;
@@ -1013,7 +1013,7 @@ static bool tx_push(canard_t* const            self,
                         canard_txfer_t,
                         list_delayed,
                         match,
-                        (match->topic_hash == tr->topic_hash) && txfer_is_reliable(match));
+                        (match->topic_hash == tr->topic_hash) && match->reliable);
         has_preceding_reliable = (match != NULL);
     }
 
@@ -1027,6 +1027,7 @@ static bool tx_push(canard_t* const            self,
                 tr->head[i]   = spool;
                 tr->cursor[i] = spool;
                 enlist_tail(&self->tx.pending[shard][i], &tr->list_pending[i]);
+                self->tx.pending_shards_bitmap[i] |= (1U << shard);
             }
         }
         tx_arm_delay_if(self, tr); // Ensure it is repeatedly re-enqueued later until acknowledged or expired.
@@ -1047,30 +1048,29 @@ static void tx_receive_ack(canard_t* const self, const uint64_t topic_hash, cons
                     tr, // Backlogged transfers may possibly have conflicting transfer-ID.
                     (tr->topic_hash == topic_hash) && (tr->transfer_id == transfer_id) && !txfer_is_backlogged(tr));
     if (tr != NULL) {
-        CANARD_ASSERT(txfer_is_reliable(tr) && (tr->topic_hash == topic_hash) && (tr->transfer_id == transfer_id));
+        CANARD_ASSERT(tr->reliable && (tr->topic_hash == topic_hash) && (tr->transfer_id == transfer_id));
         txfer_retire(self, tr, true);
     }
 }
 
-bool canard_publish(canard_t* const               self,
-                    const canard_us_t             deadline,
-                    const uint_least8_t           iface_bitmap,
-                    const canard_prio_t           priority,
-                    const uint64_t                topic_hash,
-                    const uint_least8_t           transfer_id,
-                    const canard_bytes_chain_t    payload,
-                    const canard_user_context_t   context,
-                    const canard_on_tx_feedback_t feedback)
+bool canard_publish(canard_t* const             self,
+                    const canard_us_t           deadline,
+                    const uint_least8_t         iface_bitmap,
+                    const canard_prio_t         priority,
+                    const uint64_t              topic_hash,
+                    const uint_least8_t         transfer_id,
+                    const canard_bytes_chain_t  payload,
+                    const canard_user_context_t context,
+                    const bool                  reliable)
 {
     bool ok =
       (self != NULL) && (priority < CANARD_PRIO_COUNT) && bytes_chain_valid(payload) &&
       (((iface_bitmap & CANARD_IFACE_BITMAP_ALL) != 0) && ((iface_bitmap & CANARD_IFACE_BITMAP_ALL) == iface_bitmap));
     if (ok) {
         // Compose the CAN ID.
-        const bool reliable = feedback != NULL;
-        const bool pinned   = topic_hash <= CANARD_SUBJECT_ID_MAX_1v0;
-        const bool use_1v0  = pinned && !reliable; // fallback to v1.0 whenever possible to maximize interoperability
-        uint32_t   can_id   = ((uint32_t)priority) << PRIO_SHIFT; // node-ID will be assigned at transmission time
+        const bool pinned  = topic_hash <= CANARD_SUBJECT_ID_MAX_1v0;
+        const bool use_1v0 = pinned && !reliable; // fallback to v1.0 whenever possible to maximize interoperability
+        uint32_t   can_id  = ((uint32_t)priority) << PRIO_SHIFT; // node-ID will be assigned at transmission time
         if (use_1v0) {
             can_id |= (3UL << 21U) | (uint32_t)(topic_hash << 8U); // set reserved bits 21 and 22
         } else {
@@ -1099,7 +1099,7 @@ bool canard_publish(canard_t* const               self,
                                              transfer_kind_message,
                                              topic_hash,
                                              context,
-                                             feedback);
+                                             reliable);
         ok                       = (tr != NULL) && tx_push(self, tr, final_payload, CRC_INITIAL);
     }
     return ok;
