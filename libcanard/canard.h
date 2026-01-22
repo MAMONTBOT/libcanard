@@ -389,7 +389,15 @@ struct canard_t
         /// due to the limited bus capacity; at the same time, CAN is likely to be used with small memory-limited
         /// devices. Hence we introduce a design tradeoff favoring smaller memory footprint over insertion efficiency,
         /// which is reasonable on the assumption that the number of simultaneously enqueued transfers (sic! not frames)
-        /// is typically small, on the order of a couple dozen at most.
+        /// is typically small, on the order of a couple dozen at most. At small N, linked lists are even expected to
+        /// outperform BST lookup; given r=2 is the approximate complexity premium of BST lookup over list scan,
+        /// assuming that an average list lookup ends halfway, then the complexity crossover point is about:
+        ///
+        ///     N/2 > r log2(N)
+        ///
+        /// So for r=2, we expect linked lists to outperform BSTs for less than about 15 pending transfers per shard
+        /// (per default, RPC-service and message transfers use different shards, also each priority level is separate).
+        /// The number of frames per transfer is irrelevant here as it doesn't affect the asymptotic complexity.
         ///
         /// The structures are optimized to minimize the poll complexity, since it is on the hot path, at the expense
         /// of insertion and cancellation paths. Each pending queue is a simple FIFO; the priority ordering is done

@@ -8,6 +8,9 @@
 #include <limits.h>
 #include <stddef.h>
 #include <string.h>
+#if __STDC_VERSION__ >= 202311L
+#include <stdbit.h>
+#endif
 
 /// Define this macro to include build configuration header.
 /// Usage example with CMake: "-DCANARD_CONFIG_HEADER=\"${CMAKE_CURRENT_SOURCE_DIR}/my_canard_config.h\""
@@ -126,10 +129,38 @@ static byte_t popcount_emulated(uint64_t x)
 
 static byte_t popcount(const uint64_t x)
 {
-#if defined(__GNUC__) || defined(__clang__) || defined(__CC_ARM)
+#ifdef stdc_count_ones
+    return (byte_t)stdc_count_ones(x); // C23 feature
+#elif defined(__GNUC__) || defined(__clang__) || defined(__CC_ARM)
     return (byte_t)__builtin_popcountll(x);
 #else
     return popcount_emulated(x);
+#endif
+}
+
+/// See ctz().
+static byte_t ctz_emulated(uint32_t x)
+{
+    CANARD_ASSERT(x != 0U);
+    byte_t v = 0;
+    while ((x & 1U) == 0U) {
+        x >>= 1U;
+        ++v;
+    }
+    return v;
+}
+
+/// Count trailing zeros (ctz), aka find first set (ffs), aka the index of the least-significant set bit.
+/// Undefined for zero argument.
+static byte_t ctz(const uint32_t x)
+{
+    CANARD_ASSERT(x != 0U);
+#ifdef stdc_trailing_zeros
+    return (byte_t)stdc_trailing_zeros(x); // C23 feature
+#elif defined(__GNUC__) || defined(__clang__) || defined(__CC_ARM)
+    return (byte_t)__builtin_ctzl(x);
+#else
+    return ctz_emulated(x);
 #endif
 }
 
