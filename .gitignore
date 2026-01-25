@@ -35,3 +35,4 @@ cmake-build-*/
 __pycache__/
 .DS_Store
 *.bak
+Testing/

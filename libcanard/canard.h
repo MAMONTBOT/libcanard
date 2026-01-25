@@ -106,6 +106,13 @@ extern "C"
 
 #define CANARD_P2P_TOPIC_HASH_MSb_COUNT 36U
 
+/// That would be 49 bits in total, providing excellent collision resistance for all conceivable scenarios.
+/// The MSb/LSb split ensures selectivity for pinned and non-pinned topics alike.
+/// We cannot use full 64 bits because we want the P2P header to fit into a single Classic CAN frame (7 byte payload).
+#define CANARD_P2P_TOPIC_HASH_LOWER_BOUND_MASK                                                        \
+    (((((1ULL << CANARD_P2P_TOPIC_HASH_MSb_COUNT) - 1U) << (64U - CANARD_P2P_TOPIC_HASH_MSb_COUNT)) | \
+      CANARD_SUBJECT_ID_MAX_1v0))
+
 /// See canard_t::ack_baseline_timeout.
 /// This default value might be a good starting point for many applications.
 /// The baseline timeout should be greater than the expected round-trip time (RTT) for a message at the highest
@@ -137,15 +144,15 @@ typedef enum canard_prio_t
 
 /// This number must not be less than three bits to ensure that the priority field is handled correctly.
 /// Larger values improve list manipulation performance at the cost of some memory footprint.
-/// - 3 bits ensure that each priority level has its own shard, which is the bare minimum.
-/// - 4 bits ensure that messages and RPC-service transfers are separated into dedicated shards. Recommended choice.
+/// - 3 bits ensure that each priority level has its own shard, which is the bare minimum. Not recommended.
+/// - 4 bits ensure that messages and RPC-service transfers are separated into dedicated shards. Recommended minimum.
 /// - 5 bits ensure that messages, requests, and responses are all separated. Good for higher-bandwidth applications.
 /// - More shard bits may be appropriate for some very high-bandwidth applications with many simultaneous transfers.
 #ifndef CANARD_TX_SHARDING_BITS
 #define CANARD_TX_SHARDING_BITS 4U
 #endif
 #if (CANARD_TX_SHARDING_BITS < 3)
-#error "CANARD_TX_SHARDING_BITS must be at least 3"
+#error "CANARD_TX_SHARDING_BITS must be at least 3; at least 4 for decent prioritization granularity"
 #endif
 #define CANARD_TX_SHARDS (1U << CANARD_TX_SHARDING_BITS)
 
@@ -292,8 +299,8 @@ typedef struct canard_vtable_t
     /// A new P2P message is received.
     ///
     /// The topic hash bound is less than or equal the true topic hash, which enables easy lookup using lower bounds.
-    /// The CANARD_P2P_TOPIC_HASH_MSb_COUNT MSb and 13 LSb of the topic hash are provided in the lower bound,
-    /// with the intermediate bits zeroed.
+    /// Use CANARD_P2P_TOPIC_HASH_LOWER_BOUND_MASK when comparing the lower bound to extract the relevant bits;
+    /// the irrelevant bits are guaranteed to be zero (hence why it is a lower bound).
     /// For pinned topics, the lower bound does not exceed CANARD_SUBJECT_ID_MAX_1v0 and exactly equals the subject-ID.
     ///
     /// The handler takes ownership of the payload; it must free it after use using the corresponding memory resource.
@@ -404,6 +411,11 @@ struct canard_t
         /// by having multiple queues, one per TX shard. This does not follow the full CAN ID arbitration order,
         /// but it is sufficient because the leading sharding bits of the CAN ID provide sufficient selectivity.
         ///
+        /// The linear lookup complexity is not considered an issue because real-time applications always have a bound
+        /// on the peak number of simultaneously pending transfers, which is typically low due to the limited bus
+        /// capacity; given the fixed bound, the asymptotic complexity is essentially constant time. If performance
+        /// becomes an issue in larger applications, it can be addressed by sharding the lists further.
+        ///
         /// The pending list contains transfers that are ready to be transmitted immediately.
         /// The delayed list contains transfers that will become eligible for transmission in the future;
         /// these are either reliable transfers waiting for their next retransmission attempt unless acknowledged,
@@ -414,17 +426,18 @@ struct canard_t
         /// The shards are based on the most significant bits of the CAN ID, meaning that the lowest index shard
         /// has the highest arbitration priority and should be chosen for transmission first. There is no ordering
         /// preservation guarantee between priority levels (obviously) so they all are treated as independent lists.
-        /// The pending shards bitmap is used for O(1) fetching of the highes-priority non-empty shard during poll()
+        /// The pending shards bitmap is used for O(1) fetching of the highest-priority non-empty shard during poll()
         /// -- no scanning needed.
         ///
         /// Unlike Cyphal/UDP, we don't have a dedicated deadline index, again to conserve memory. Instead, we do
         /// iterative scanning during poll() by storing the iteration cursors here. They are invalidated as needed.
         uint32_t      pending_shards_bitmap[CANARD_IFACE_COUNT]; ///< Bit index corresponds to non-empty pending shards.
         canard_list_t pending[CANARD_TX_SHARDS][CANARD_IFACE_COUNT]; ///< Next to transmit at the head.
-        canard_list_t delayed[CANARD_TX_SHARDS]; ///< Soonest retry time at the head. HEAT_DEATH if backlogged, at tail.
-        canard_list_t oldest[2];                 ///< ALL transfers, oldest at head, sharded by QoS (1=reliable).
+        canard_list_t delayed[CANARD_TX_SHARDS]; ///< Soonest retry time at head. HEAT_DEATH if backlogged, at tail.
+        canard_list_t agewise;                   ///< ALL transfers, oldest at the head.
+        canard_tree_t* reliable; ///< Reliable ordered by (topic hash, transfer-ID) for dup detection and ack.
 
-        canard_txfer_t* iterator[2]; ///< For iterative poll() scanning, sharded by QoS like oldest; NULL to restart.
+        canard_txfer_t* iter; ///< For iterative poll() scanning; NULL to restart.
     } tx;
 
     struct
@@ -445,6 +458,7 @@ struct canard_t
         uint64_t tx_capacity;   ///< A transfer could not be enqueued due to queue capacity limit.
         uint64_t tx_sacrifice;  ///< A transfer had to be sacrificed to make room for a new transfer.
         uint64_t tx_expiration; ///< A transfer had to be dequeued due to deadline expiration.
+        uint64_t tx_duplicate;  ///< A transfer with the same topic hash and transfer-ID is already pending.
         uint64_t rx_frame;      ///< A received frame was malformed and thus dropped.
         uint64_t rx_transfer;   ///< A transfer could not be reassembled correctly.
     } err;
