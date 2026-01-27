@@ -1512,11 +1512,11 @@ int main(void)
     RUN_TEST(test_tx_push_unreliable_not_in_reliable_tree);
     RUN_TEST(test_tx_push_empty_payload);
     RUN_TEST(test_tx_push_v0_empty_payload);
-    // RUN_TEST(test_tx_push_with_topic_hash);
+    RUN_TEST(test_tx_push_with_topic_hash);
     RUN_TEST(test_tx_push_fragmented_payload);
     RUN_TEST(test_tx_push_large_payload_fd);
-    // RUN_TEST(test_tx_push_duplicate_reliable_transfer);
-    // RUN_TEST(test_tx_push_different_topic_hash_no_blocking);
-    // RUN_TEST(test_tx_push_pending_transfer_blocks_new);
+    RUN_TEST(test_tx_push_duplicate_reliable_transfer);
+    RUN_TEST(test_tx_push_different_topic_hash_no_blocking);
+    RUN_TEST(test_tx_push_pending_transfer_blocks_new);
     return UNITY_END();
 }

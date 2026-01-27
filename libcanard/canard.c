@@ -617,6 +617,17 @@ static byte_t txfer_shard(const canard_txfer_t* const tr)
 
 static bool txfer_is_backlogged(const canard_txfer_t* const tr) { return tr->delayed_until == HEAT_DEATH; }
 
+static bool txfer_is_pending(const canard_t* const self, const canard_txfer_t* const tr)
+{
+    const byte_t shard = txfer_shard(tr);
+    FOREACH_IFACE (i) {
+        if (is_listed(&self->tx.pending[shard][i], &tr->list_pending[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void txfer_free_payload(canard_t* const self, canard_txfer_t* const tr)
 {
     CANARD_ASSERT(tr != NULL);
@@ -1006,9 +1017,10 @@ static bool tx_push(canard_t* const            self,
     // trying to push too many reliable transfers on the same topic too quickly.
     // Insert at the same time to avoid double tree walk.
     if (tr->reliable) {
-        const txfer_key_t     key = { .topic_hash = tr->topic_hash, .transfer_id = tr->transfer_id };
-        canard_txfer_t* const rel = CAVL2_TO_OWNER(
-          cavl2_find_or_insert(&self->tx.reliable, &key, tx_cavl_compare_reliable, tr, cavl2_trivial_factory),
+        const txfer_key_t           key = { .topic_hash = tr->topic_hash, .transfer_id = tr->transfer_id };
+        const canard_txfer_t* const rel = CAVL2_TO_OWNER(
+          cavl2_find_or_insert(
+            &self->tx.reliable, &key, tx_cavl_compare_reliable, &tr->index_reliable, cavl2_trivial_factory),
           canard_txfer_t,
           index_reliable);
         if (rel != tr) { // Duplicate found.
@@ -1092,9 +1104,11 @@ static bool tx_push(canard_t* const            self,
           cavl2_lower_bound(self->tx.reliable, &key, tx_cavl_compare_reliable), canard_txfer_t, index_reliable);
         while ((rel != NULL) && (rel->topic_hash == tr->topic_hash)) {
             if ((rel != tr) && (txfer_shard(rel) == shard)) {
-                const bool delayed = rel->delayed_until > BIG_BANG; // Maybe backlogged also, but it's all the same.
+                // Check if the transfer is delayed (waiting for retransmission) or pending (waiting for first tx).
+                const bool delayed = rel->delayed_until > BIG_BANG; // In delayed list, waiting for retransmission.
+                const bool pending = txfer_is_pending(self, rel);
                 CANARD_ASSERT((!delayed) || is_listed(&self->tx.delayed[shard], &rel->list_delayed));
-                if (delayed) {
+                if (delayed || pending) {
                     has_preceding_reliable = true;
                     break;
                 }
@@ -1114,7 +1128,11 @@ static bool tx_push(canard_t* const            self,
                 self->tx.pending_shards_bitmap[i] |= (1U << shard);
             }
         }
-        tx_arm_delay_if(self, tr); // Ensure it is repeatedly re-enqueued later until acknowledged or expired.
+        // tx_arm_delay_if is NOT called here; the retransmission timer is armed after transmission, not before.
+        // The transfer remains with delayed_until = BIG_BANG (set by txfer_new), ready for immediate transmission.
+        // For unreliable transfers, no retransmission is scheduled. For reliable transfers, the retransmission will be
+        // scheduled after the first transmission attempt completes.
+        CANARD_ASSERT(tr->delayed_until == BIG_BANG);
     }
     return true;
 }
