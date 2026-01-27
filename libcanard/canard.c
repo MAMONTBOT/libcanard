@@ -731,24 +731,30 @@ static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const b
     // may be reordered, which we accept.
     // The backlog is ordered with the oldest at the head, so the first topic match is the correct one to promote.
     if ((!backlogged) && reliable) {
-        LIST_FIND_FIRST(self->tx.delayed[shard],
-                        canard_txfer_t,
-                        list_delayed,
-                        match,
-                        (match->topic_hash == tr->topic_hash) && txfer_is_backlogged(match));
-        if (match != NULL) { // Found a matching topic to promote.
-            CANARD_ASSERT((match->topic_hash == tr->topic_hash) && txfer_is_backlogged(match));
-            CANARD_ASSERT((match->iface_bitmap & CANARD_IFACE_BITMAP_ALL) != 0);
-            FOREACH_IFACE (i) { // Append to the pending transmission lists for all requested interfaces.
-                CANARD_ASSERT(!is_listed(&self->tx.pending[shard][i], &match->list_pending[i]));
-                if ((match->iface_bitmap & (1U << i)) != 0U) {
-                    CANARD_ASSERT(match->cursor[i] == match->head[i]); // must be rewound to the beginning
-                    CANARD_ASSERT(match->cursor[i] != NULL);
-                    enlist_tail(&self->tx.pending[shard][i], &match->list_pending[i]);
-                    self->tx.pending_shards_bitmap[i] |= (1U << shard);
+        canard_txfer_t* that = LIST_HEAD(self->tx.delayed[shard], canard_txfer_t, list_delayed);
+        while (that != NULL) {
+            CANARD_ASSERT(that->delayed_until != BIG_BANG);
+            canard_txfer_t* const next = LIST_NEXT(that, canard_txfer_t, list_delayed);
+            if ((that->topic_hash == tr->topic_hash) && txfer_is_backlogged(that)) {
+                // Found a backlogged transfer on the same topic. It must be promoted now.
+                CANARD_ASSERT((that->iface_bitmap & CANARD_IFACE_BITMAP_ALL) != 0);
+                FOREACH_IFACE (i) { // Append to the pending transmission lists for all requested interfaces.
+                    CANARD_ASSERT(!is_listed(&self->tx.pending[shard][i], &that->list_pending[i]));
+                    if ((that->iface_bitmap & (1U << i)) != 0U) {
+                        CANARD_ASSERT(that->cursor[i] == that->head[i]); // must be rewound to the beginning
+                        CANARD_ASSERT(that->cursor[i] != NULL);
+                        enlist_tail(&self->tx.pending[shard][i], &that->list_pending[i]);
+                        self->tx.pending_shards_bitmap[i] |= (1U << shard);
+                    }
+                }
+                tx_arm_delay_if(self, that);
+                // If this is a reliable transfer, no further promotions can take place -- the rest are backlogged
+                // behind the reliable one. All best-effort transfers can be promoted at once though.
+                if (that->reliable) {
+                    break;
                 }
             }
-            tx_arm_delay_if(self, match);
+            that = next;
         }
     }
 
