@@ -470,6 +470,8 @@ struct canard_t
     uint_least8_t         p2p_transfer_id[CANARD_NODE_ID_CAPACITY];
 
     const canard_vtable_t* vtable;
+
+    void* user_context;
 };
 
 /// The TX queue is shared between all redundant interfaces with deduplication (each frame is enqueued only once).

@@ -5,11 +5,17 @@
 #include "helpers.h"
 #include <unity.h>
 
-// Mock time for vtable.
+// Test context for vtable callbacks.
+typedef struct
+{
+    canard_us_t     now;
+    canard_vtable_t vtable;
+} test_context_t;
+
 static canard_us_t mock_now(canard_t* const self)
 {
-    (void)self;
-    return 0;
+    const test_context_t* ctx = (const test_context_t*)self->user_context;
+    return (ctx != NULL) ? ctx->now : 0;
 }
 
 // Dummy feedback callback for reliable transfers (matches vtable signature).
@@ -26,15 +32,21 @@ static void dummy_feedback(canard_t* const       self,
     (void)acknowledgements;
 }
 
-// Mock vtable for tests.
-static const canard_vtable_t mock_vtable = {
-    .now           = mock_now,
-    .on_p2p        = NULL,
-    .tx            = NULL,
-    .tx_subject_id = NULL,
-    .filter        = NULL,
-    .feedback      = dummy_feedback,
-};
+// Helper to initialize the test context and wire it into canard_t.
+static void init_test_context(canard_t* const self, test_context_t* const ctx)
+{
+    ctx->now    = 0;
+    ctx->vtable = (canard_vtable_t){
+        .now           = mock_now,
+        .on_p2p        = NULL,
+        .tx            = NULL,
+        .tx_subject_id = NULL,
+        .filter        = NULL,
+        .feedback      = dummy_feedback,
+    };
+    self->user_context = ctx;
+    self->vtable       = &ctx->vtable;
+}
 
 // Helper macro to get frame size (dlc is a bitfield, size not stored directly).
 #define FRAME_SIZE(f) canard_dlc_to_len[(f)->dlc]
@@ -61,12 +73,12 @@ static void free_frames(canard_t* const self, tx_frame_t* head)
 }
 
 // Helper to set up a minimal canard instance for tx_spool tests.
-static void setup_canard_for_spool(canard_t* self, instrumented_allocator_t* alloc)
+static void setup_canard_for_spool(canard_t* self, instrumented_allocator_t* alloc, test_context_t* ctx)
 {
     instrumented_allocator_new(alloc);
     memset(self, 0, sizeof(*self));
+    init_test_context(self, ctx);
     self->mem.tx_frame = instrumented_allocator_make_resource(alloc);
-    self->vtable       = &mock_vtable;
 }
 
 // ==============================================  tx_spool (Cyphal v1)  ==============================================
@@ -75,7 +87,8 @@ static void test_tx_spool_single_frame_empty(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     const canard_bytes_chain_t payload = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
 
@@ -95,7 +108,8 @@ static void test_tx_spool_single_frame_small(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     const uint8_t        data[]  = { 0xDE, 0xAD, 0xBE, 0xEF };
     canard_bytes_chain_t payload = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
@@ -121,7 +135,8 @@ static void test_tx_spool_single_frame_max_classic(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     const uint8_t        data[]  = { 1, 2, 3, 4, 5, 6, 7 }; // 7 bytes, max single-frame for Classic CAN.
     canard_bytes_chain_t payload = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
@@ -147,7 +162,8 @@ static void test_tx_spool_single_multi_boundary(void)
     // 8 bytes >= MTU-1 (7), so it becomes multi-frame with CRC.
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     const uint8_t        data[]  = { 0, 1, 2, 3, 4, 5, 6, 7 }; // Exactly 8 bytes.
     canard_bytes_chain_t payload = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
@@ -184,7 +200,8 @@ static void test_tx_spool_single_frame_fd(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     const uint8_t        data[20] = { 0 }; // 20 bytes payload, MTU=64. Single frame.
     canard_bytes_chain_t payload  = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
@@ -210,7 +227,8 @@ static void test_tx_spool_fd_dlc_rounding(void)
     // Test various CAN FD DLC rounding cases: valid sizes are 8, 12, 16, 20, 24, 32, 48, 64.
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     // Test: 9 bytes payload + 1 tail = 10 -> rounds to 12.
     {
@@ -275,7 +293,8 @@ static void test_tx_spool_multi_frame_classic(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     // 10 bytes payload forces multi-frame with MTU=8 (7 bytes payload per frame max).
     const uint8_t        data[10] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
@@ -316,7 +335,8 @@ static void test_tx_spool_multi_frame_three_frames(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     // 20 bytes + 2 CRC = 22. At 7 bytes/frame: ceil(22/7) = 4 frames.
     const uint8_t        data[20] = { 0 };
@@ -348,7 +368,8 @@ static void test_tx_spool_multi_frame_fd(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     // 100 bytes payload, MTU=64. 100 + 2 CRC = 102. At 63 bytes/frame: ceil(102/63) = 2 frames.
     uint8_t data[100];
@@ -398,7 +419,8 @@ static void test_tx_spool_fragmented_payload(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     const uint8_t        f1[] = { 0xAA, 0xBB };
     const uint8_t        f2[] = { 0xCC, 0xDD, 0xEE };
@@ -428,7 +450,8 @@ static void test_tx_spool_crc_split(void)
     // With MTU=8 (7 payload bytes per frame), 13 bytes payload + 2 CRC = 15 bytes total.
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     const uint8_t        data[13] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
     canard_bytes_chain_t payload  = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
@@ -477,7 +500,8 @@ static void test_tx_spool_crc_only_last_frame(void)
     // With MTU=8 (7 payload bytes per frame), 14 bytes payload + 2 CRC = 16 bytes total.
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     const uint8_t        data[14] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
     canard_bytes_chain_t payload  = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
@@ -524,7 +548,8 @@ static void test_tx_spool_oom(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
     alloc.limit_bytes = 0; // No memory available.
 
     const uint8_t        data[]  = { 1, 2, 3 };
@@ -539,7 +564,8 @@ static void test_tx_spool_oom_mid_chain(void)
     // 20 bytes payload requires 4 frames. Fail on the 3rd allocation.
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
     alloc.limit_fragments = 2; // Allow only 2 allocations.
 
     const uint8_t        data[20] = { 0 };
@@ -561,7 +587,8 @@ static void test_tx_spool_v0_single_frame_empty(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     const canard_bytes_chain_t payload = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
 
@@ -580,7 +607,8 @@ static void test_tx_spool_v0_single_frame_max(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     const uint8_t        data[]  = { 1, 2, 3, 4, 5, 6, 7 }; // 7 bytes, single frame (7 < 8).
     canard_bytes_chain_t payload = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
@@ -605,7 +633,8 @@ static void test_tx_spool_v0_single_multi_boundary(void)
     // 8 bytes >= MTU (8), so it becomes multi-frame with CRC prepended.
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     const uint8_t        data[]   = { 0, 1, 2, 3, 4, 5, 6, 7 }; // Exactly 8 bytes.
     canard_bytes_chain_t payload  = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
@@ -646,7 +675,8 @@ static void test_tx_spool_v0_multi_frame(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     // 10 bytes payload forces multi-frame (>= 8).
     // v0: CRC prepended. 2 CRC + 10 payload = 12 bytes. At 7 bytes/frame: ceil(12/7) = 2 frames.
@@ -689,7 +719,8 @@ static void test_tx_spool_v0_multi_frame_three_frames(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
 
     // 20 bytes payload. v0: 2 CRC + 20 = 22 bytes. At 7 bytes/frame: ceil(22/7) = 4 frames.
     const uint8_t        data[20] = { 0 };
@@ -721,7 +752,8 @@ static void test_tx_spool_v0_oom(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
     alloc.limit_bytes = 0;
 
     const uint8_t        data[]  = { 1, 2, 3 };
@@ -736,7 +768,8 @@ static void test_tx_spool_v0_oom_mid_chain(void)
     // 20 bytes payload requires 4 frames in v0. Fail on the 3rd allocation.
     canard_t                 self;
     instrumented_allocator_t alloc;
-    setup_canard_for_spool(&self, &alloc);
+    test_context_t           ctx;
+    setup_canard_for_spool(&self, &alloc, &ctx);
     alloc.limit_fragments = 2; // Allow only 2 allocations.
 
     const uint8_t        data[20] = { 0 };
@@ -797,17 +830,32 @@ static void test_tx_predict_frame_count(void)
 // Helper to set up a basic canard instance for tx_push tests.
 static void setup_canard_for_tx_push(canard_t*                 self,
                                      instrumented_allocator_t* alloc_tr,
-                                     instrumented_allocator_t* alloc_fr)
+                                     instrumented_allocator_t* alloc_fr,
+                                     test_context_t*           ctx)
 {
     instrumented_allocator_new(alloc_tr);
     instrumented_allocator_new(alloc_fr);
     memset(self, 0, sizeof(*self));
+    init_test_context(self, ctx);
     self->mem.tx_transfer      = instrumented_allocator_make_resource(alloc_tr);
     self->mem.tx_frame         = instrumented_allocator_make_resource(alloc_fr);
     self->tx.queue_capacity    = 100; // Large enough for most tests.
     self->tx.fd                = true;
     self->ack_baseline_timeout = CANARD_TX_ACK_BASELINE_TIMEOUT_DEFAULT_us;
-    self->vtable               = &mock_vtable;
+}
+
+// Helper to remove a transfer from pending lists.
+static void delist_pending(canard_t* const self, canard_txfer_t* const tr)
+{
+    const byte_t shard = txfer_shard(tr);
+    FOREACH_IFACE (i) {
+        if ((tr->iface_bitmap & (1U << i)) != 0U) {
+            delist(&self->tx.pending[shard][i], &tr->list_pending[i]);
+            if (self->tx.pending[shard][i].head == NULL) {
+                self->tx.pending_shards_bitmap[i] &= ~(1U << shard);
+            }
+        }
+    }
 }
 
 // Helper to create a canard_txfer_t for testing using txfer_new.
@@ -836,7 +884,8 @@ static void test_tx_push_basic_v1_classic(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
     self.tx.fd = false; // Classic CAN mode.
 
     // Create a transfer.
@@ -870,7 +919,8 @@ static void test_tx_push_basic_v1_fd(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     canard_txfer_t* tr = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, false, 1, 0x12345678, 7);
     TEST_ASSERT_NOT_NULL(tr);
@@ -896,7 +946,8 @@ static void test_tx_push_v1_multi_frame(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
     self.tx.fd = false;
 
     canard_txfer_t* tr =
@@ -922,7 +973,8 @@ static void test_tx_push_v0_always_classic_mtu(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
     // Global FD mode is on, but v0 should not use it.
 
     // v0 transfer must have fd=false (this is enforced by tx_push assertion).
@@ -948,7 +1000,8 @@ static void test_tx_push_v0_request(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     // v0 transfer must have fd=false.
     canard_txfer_t* tr =
@@ -972,7 +1025,8 @@ static void test_tx_push_v0_response(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     // v0 transfer must have fd=false.
     canard_txfer_t* tr =
@@ -996,7 +1050,8 @@ static void test_tx_push_oom_frame_alloc(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
     alloc_fr.limit_bytes = 0; // No frame memory.
 
     canard_txfer_t* tr =
@@ -1014,12 +1069,35 @@ static void test_tx_push_oom_frame_alloc(void)
     TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
 }
 
+static void test_tx_push_reliable_oom_removes_index(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+    alloc_fr.limit_bytes = 0; // No frame memory.
+
+    // Reliable transfer should be removed from the tree on failure.
+    canard_txfer_t* tr = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, false, true, 1, 0x12345678, 0);
+    TEST_ASSERT_NOT_NULL(tr);
+    const uint8_t              data[]  = { 1, 2, 3 };
+    const canard_bytes_chain_t payload = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
+
+    const bool ok = tx_push(&self, tr, payload, CRC_INITIAL);
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_NULL(self.tx.reliable);
+    TEST_ASSERT_EQUAL_UINT64(1, self.err.oom);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+}
+
 static void test_tx_push_oom_mid_spool(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
     alloc_fr.limit_fragments = 2; // Allow only 2 frame allocations.
 
     canard_txfer_t* tr =
@@ -1043,7 +1121,8 @@ static void test_tx_push_queue_capacity_exceeded(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
     self.tx.queue_capacity = 2; // Small capacity.
     self.tx.queue_size     = 2; // Already full.
 
@@ -1065,7 +1144,8 @@ static void test_tx_push_queue_capacity_too_small(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
     self.tx.queue_capacity = 2; // Smaller than needed frames.
 
     canard_txfer_t* tr =
@@ -1082,12 +1162,35 @@ static void test_tx_push_queue_capacity_too_small(void)
     TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
 }
 
+static void test_tx_push_reliable_capacity_failure_removes_index(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+    self.tx.queue_capacity = 1;
+
+    // Reliable transfer needs more frames than capacity.
+    canard_txfer_t* tr = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, false, true, 1, 0x12345678, 0);
+    TEST_ASSERT_NOT_NULL(tr);
+    const uint8_t              data[20] = { 0 };
+    const canard_bytes_chain_t payload  = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
+
+    const bool ok = tx_push(&self, tr, payload, CRC_INITIAL);
+    TEST_ASSERT_FALSE(ok);
+    TEST_ASSERT_NULL(self.tx.reliable);
+    TEST_ASSERT_EQUAL_UINT64(1, self.err.tx_capacity);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+}
+
 static void test_tx_push_multi_iface_refcount(void)
 {
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     // Use all available interfaces (CANARD_IFACE_COUNT, typically 2).
     const uint_least8_t iface_bitmap = CANARD_IFACE_BITMAP_ALL;
@@ -1121,7 +1224,8 @@ static void test_tx_push_single_iface_refcount(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     // Single interface (iface 1).
     canard_txfer_t* tr =
@@ -1151,7 +1255,8 @@ static void test_tx_push_multi_frame_multi_iface(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
     self.tx.fd = false;
 
     // Use all available interfaces.
@@ -1184,7 +1289,8 @@ static void test_tx_push_reliable_indexed(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     // Reliable transfer should be added to agewise list and reliable tree.
     canard_txfer_t* tr = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, true, 1, 0x12345678, 0);
@@ -1208,7 +1314,8 @@ static void test_tx_push_unreliable_not_in_reliable_tree(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     // Unreliable transfer should be in agewise list but NOT in reliable tree.
     canard_txfer_t* tr = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, false, 1, 0x12345678, 0);
@@ -1232,7 +1339,8 @@ static void test_tx_push_empty_payload(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     canard_txfer_t* tr = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, false, 1, 0x12345678, 0);
     TEST_ASSERT_NOT_NULL(tr);
@@ -1253,7 +1361,8 @@ static void test_tx_push_v0_empty_payload(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     // v0 transfer must have fd=false.
     canard_txfer_t* tr =
@@ -1276,7 +1385,8 @@ static void test_tx_push_with_topic_hash(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     // Create a transfer with a specific topic hash.
     canard_txfer_t* tr = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, false, 1, 0x12345678, 5);
@@ -1303,7 +1413,8 @@ static void test_tx_push_fragmented_payload(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     canard_txfer_t* tr = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, false, 1, 0x12345678, 0);
     TEST_ASSERT_NOT_NULL(tr);
@@ -1327,7 +1438,8 @@ static void test_tx_push_large_payload_fd(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     canard_txfer_t* tr = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, false, 1, 0x12345678, 0);
     TEST_ASSERT_NOT_NULL(tr);
@@ -1352,7 +1464,8 @@ static void test_tx_push_duplicate_reliable_transfer(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     const uint64_t             topic_hash  = 0x1234567890ABCDEFULL;
     const byte_t               transfer_id = 5;
@@ -1392,7 +1505,8 @@ static void test_tx_push_different_topic_hash_no_blocking(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     const uint8_t              data[]  = { 1, 2, 3 };
     const canard_bytes_chain_t payload = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
@@ -1405,6 +1519,7 @@ static void test_tx_push_different_topic_hash_no_blocking(void)
     const bool ok1         = tx_push(&self, tr1, payload, CRC_INITIAL);
     TEST_ASSERT_TRUE(ok1);
     TEST_ASSERT_EQUAL_INT64(BIG_BANG, tr1->delayed_until);
+    TEST_ASSERT_FALSE(is_listed(&self.tx.delayed[txfer_shard(tr1)], &tr1->list_delayed));
 
     // Push second reliable transfer with different topic hash B.
     // This should NOT be backlogged because topic hashes differ.
@@ -1417,6 +1532,7 @@ static void test_tx_push_different_topic_hash_no_blocking(void)
 
     // Verify tr2 is NOT backlogged (different topic hash).
     TEST_ASSERT_EQUAL_INT64(BIG_BANG, tr2->delayed_until);
+    TEST_ASSERT_FALSE(is_listed(&self.tx.delayed[txfer_shard(tr2)], &tr2->list_delayed));
 
     txfer_retire(&self, tr2, true);
     txfer_retire(&self, tr1, true);
@@ -1429,13 +1545,14 @@ static void test_tx_push_pending_transfer_blocks_new(void)
     canard_t                 self;
     instrumented_allocator_t alloc_tr;
     instrumented_allocator_t alloc_fr;
-    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr);
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     const uint64_t             topic_hash = 0xFEDCBA9876543210ULL;
     const uint8_t              data[]     = { 1, 2, 3 };
     const canard_bytes_chain_t payload    = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
 
-    // Push first reliable transfer (it will be pending with delayed_until == BIG_BANG).
+    // Push first reliable transfer (it will be pending with a scheduled delay).
     canard_txfer_t* tr1 = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, true, 1, 0x12345678, 1);
     TEST_ASSERT_NOT_NULL(tr1);
     tr1->topic_hash        = topic_hash;
@@ -1443,6 +1560,7 @@ static void test_tx_push_pending_transfer_blocks_new(void)
     const bool ok1         = tx_push(&self, tr1, payload, CRC_INITIAL);
     TEST_ASSERT_TRUE(ok1);
     TEST_ASSERT_EQUAL_INT64(BIG_BANG, tr1->delayed_until);
+    TEST_ASSERT_FALSE(is_listed(&self.tx.delayed[txfer_shard(tr1)], &tr1->list_delayed));
 
     // Push second reliable transfer with same topic hash but different transfer ID.
     // This should be backlogged because tr1 is pending (will be transmitted).
@@ -1458,6 +1576,426 @@ static void test_tx_push_pending_transfer_blocks_new(void)
 
     txfer_retire(&self, tr2, true);
     txfer_retire(&self, tr1, true);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_fr.allocated_fragments);
+}
+
+// ===========================================  tx scheduling and retire  ============================================
+
+static void test_txfer_is_pending_false(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+
+    // Transfer not listed in pending should return false.
+    canard_txfer_t* tr =
+      make_test_transfer(self.mem.tx_transfer, transfer_kind_message, false, false, 1, 0x12345678, 0);
+    TEST_ASSERT_NOT_NULL(tr);
+    TEST_ASSERT_FALSE(txfer_is_pending(&self, tr));
+
+    mem_free(self.mem.tx_transfer, sizeof(canard_txfer_t), tr);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+}
+
+static void test_tx_arm_delay_if_reliable_schedules(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+    self.ack_baseline_timeout = 1;
+
+    // Push a reliable transfer.
+    canard_txfer_t* tr = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, true, 1, 0, 1);
+    TEST_ASSERT_NOT_NULL(tr);
+    const canard_bytes_chain_t payload = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
+    TEST_ASSERT_TRUE(tx_push(&self, tr, payload, CRC_INITIAL));
+
+    // Arm a retransmission delay.
+    tx_arm_delay_if(&self, tr);
+    TEST_ASSERT_TRUE(tr->delayed_until > BIG_BANG);
+    TEST_ASSERT_TRUE(is_listed(&self.tx.delayed[txfer_shard(tr)], &tr->list_delayed));
+
+    // Clean up.
+    txfer_retire(&self, tr, true);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_fr.allocated_fragments);
+}
+
+static void test_txfer_retire_updates_iter(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+
+    // Push two transfers and set iter to the first.
+    const canard_bytes_chain_t payload = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
+    canard_txfer_t*            tr1 =
+      make_test_transfer(self.mem.tx_transfer, transfer_kind_message, false, false, 1, 0x12345678, 1);
+    TEST_ASSERT_NOT_NULL(tr1);
+    TEST_ASSERT_TRUE(tx_push(&self, tr1, payload, CRC_INITIAL));
+    canard_txfer_t* tr2 =
+      make_test_transfer(self.mem.tx_transfer, transfer_kind_message, false, false, 1, 0x12345678, 2);
+    TEST_ASSERT_NOT_NULL(tr2);
+    TEST_ASSERT_TRUE(tx_push(&self, tr2, payload, CRC_INITIAL));
+    self.tx.iter = tr1;
+
+    // Retire the head and verify the iterator advances.
+    txfer_retire(&self, tr1, true);
+    TEST_ASSERT_EQUAL_PTR(tr2, self.tx.iter);
+
+    // Clean up.
+    txfer_retire(&self, tr2, true);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_fr.allocated_fragments);
+}
+
+static void test_tx_arm_delay_if_deadline_too_close(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+    self.ack_baseline_timeout = 4;
+
+    // Push a reliable transfer with a short deadline.
+    canard_txfer_t* tr = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, true, 1, 0, 2);
+    TEST_ASSERT_NOT_NULL(tr);
+    tr->deadline                       = 5;
+    const canard_bytes_chain_t payload = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
+    TEST_ASSERT_TRUE(tx_push(&self, tr, payload, CRC_INITIAL));
+
+    // Verify the delay is not armed.
+    tx_arm_delay_if(&self, tr);
+    TEST_ASSERT_EQUAL_INT64(BIG_BANG, tr->delayed_until);
+    TEST_ASSERT_FALSE(is_listed(&self.tx.delayed[txfer_shard(tr)], &tr->list_delayed));
+
+    // Clean up.
+    txfer_retire(&self, tr, false);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_fr.allocated_fragments);
+}
+
+static void test_tx_promote_delayed_requeues(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+    self.ack_baseline_timeout = 1;
+
+    // Push a reliable transfer and clear pending lists.
+    canard_txfer_t* tr = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, true, 1, 0, 3);
+    TEST_ASSERT_NOT_NULL(tr);
+    const canard_bytes_chain_t payload = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
+    TEST_ASSERT_TRUE(tx_push(&self, tr, payload, CRC_INITIAL));
+    delist_pending(&self, tr);
+    TEST_ASSERT_FALSE(is_listed(&self.tx.pending[txfer_shard(tr)][0], &tr->list_pending[0]));
+
+    // Arm a delay and promote it.
+    tx_arm_delay_if(&self, tr);
+    ctx.now = tr->delayed_until;
+    tx_promote_delayed(&self, ctx.now);
+    TEST_ASSERT_TRUE(is_listed(&self.tx.pending[txfer_shard(tr)][0], &tr->list_pending[0]));
+
+    // Clean up.
+    txfer_retire(&self, tr, true);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_fr.allocated_fragments);
+}
+
+static void test_tx_push_sacrifice_oldest(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+    self.tx.queue_capacity = 1;
+
+    // Push the first transfer.
+    canard_txfer_t* tr1 = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, false, 1, 0, 1);
+    TEST_ASSERT_NOT_NULL(tr1);
+    const canard_bytes_chain_t payload = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
+    TEST_ASSERT_TRUE(tx_push(&self, tr1, payload, CRC_INITIAL));
+    TEST_ASSERT_EQUAL_size_t(1, self.tx.queue_size);
+
+    // Push another transfer and force a sacrifice.
+    canard_txfer_t* tr2 = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, false, 1, 0, 2);
+    TEST_ASSERT_NOT_NULL(tr2);
+    TEST_ASSERT_TRUE(tx_push(&self, tr2, payload, CRC_INITIAL));
+    TEST_ASSERT_EQUAL_UINT64(1, self.err.tx_sacrifice);
+    TEST_ASSERT_EQUAL_size_t(1, self.tx.queue_size);
+    TEST_ASSERT_EQUAL_PTR(tr2, LIST_HEAD(self.tx.agewise, canard_txfer_t, list_agewise));
+
+    // Clean up.
+    txfer_retire(&self, tr2, true);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_fr.allocated_fragments);
+}
+
+static void test_tx_receive_ack_retires(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+
+    // Push two reliable transfers with the same topic hash.
+    const uint64_t             topic_hash  = 0x123456789ABCDEF0ULL;
+    const byte_t               tid1        = 1;
+    const byte_t               tid2        = 2;
+    const canard_bytes_chain_t payload     = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
+    const uint64_t             lower_bound = topic_hash & CANARD_P2P_TOPIC_HASH_LOWER_BOUND_MASK;
+    canard_txfer_t* tr1 = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, true, 1, 0, tid1);
+    TEST_ASSERT_NOT_NULL(tr1);
+    tr1->topic_hash        = topic_hash;
+    tr1->remote_topic_hash = topic_hash;
+    TEST_ASSERT_TRUE(tx_push(&self, tr1, payload, CRC_INITIAL));
+    canard_txfer_t* tr2 = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, true, 1, 0, tid2);
+    TEST_ASSERT_NOT_NULL(tr2);
+    tr2->topic_hash        = topic_hash;
+    tr2->remote_topic_hash = topic_hash;
+    TEST_ASSERT_TRUE(tx_push(&self, tr2, payload, CRC_INITIAL));
+
+    // Retire the first transfer via ACK.
+    tx_receive_ack(&self, lower_bound, tid1);
+    TEST_ASSERT_EQUAL_size_t(1, self.tx.queue_size);
+    TEST_ASSERT_NOT_NULL(self.tx.reliable);
+    TEST_ASSERT_EQUAL_UINT8(tid2, LIST_HEAD(self.tx.agewise, canard_txfer_t, list_agewise)->transfer_id);
+
+    // Clean up the remaining transfer.
+    txfer_retire(&self, tr2, true);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_fr.allocated_fragments);
+}
+
+static void test_tx_receive_ack_scan_miss(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+
+    // Push reliable transfers with a gap in transfer IDs.
+    const uint64_t             topic_hash  = 0x123456789ABCDEF0ULL;
+    const canard_bytes_chain_t payload     = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
+    const uint64_t             lower_bound = topic_hash & CANARD_P2P_TOPIC_HASH_LOWER_BOUND_MASK;
+    canard_txfer_t*            tr1 =
+      make_test_transfer(self.mem.tx_transfer, transfer_kind_message, false, true, 1, 0x12345678, 1);
+    TEST_ASSERT_NOT_NULL(tr1);
+    tr1->topic_hash        = topic_hash;
+    tr1->remote_topic_hash = topic_hash;
+    TEST_ASSERT_TRUE(tx_push(&self, tr1, payload, CRC_INITIAL));
+    canard_txfer_t* tr3 =
+      make_test_transfer(self.mem.tx_transfer, transfer_kind_message, false, true, 1, 0x12345678, 3);
+    TEST_ASSERT_NOT_NULL(tr3);
+    tr3->topic_hash        = topic_hash;
+    tr3->remote_topic_hash = topic_hash;
+    TEST_ASSERT_TRUE(tx_push(&self, tr3, payload, CRC_INITIAL));
+
+    // Use a missing transfer-ID to force a scan past the first match.
+    tx_receive_ack(&self, lower_bound, 2);
+    TEST_ASSERT_EQUAL_size_t(2, self.tx.queue_size);
+    TEST_ASSERT_NOT_NULL(self.tx.reliable);
+
+    // Clean up.
+    txfer_retire(&self, tr1, true);
+    txfer_retire(&self, tr3, true);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_fr.allocated_fragments);
+}
+
+static void test_tx_receive_ack_no_match(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+
+    // Push a reliable transfer.
+    const uint64_t             topic_hash = 0x123456789ABCDEF0ULL;
+    const canard_bytes_chain_t payload    = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
+    canard_txfer_t* tr = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, true, 1, 0, 1);
+    TEST_ASSERT_NOT_NULL(tr);
+    tr->topic_hash        = topic_hash;
+    tr->remote_topic_hash = topic_hash;
+    TEST_ASSERT_TRUE(tx_push(&self, tr, payload, CRC_INITIAL));
+
+    // Try an ACK with a mismatching lower bound.
+    const uint64_t lower_bound = (topic_hash & CANARD_P2P_TOPIC_HASH_LOWER_BOUND_MASK) ^ 1ULL;
+    tx_receive_ack(&self, lower_bound, 1);
+    TEST_ASSERT_EQUAL_size_t(1, self.tx.queue_size);
+    TEST_ASSERT_NOT_NULL(self.tx.reliable);
+
+    // Clean up.
+    txfer_retire(&self, tr, true);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_fr.allocated_fragments);
+}
+
+static void test_txfer_retire_promotes_backlog(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+
+    // Push a reliable transfer and backlog others behind it.
+    const uint64_t             topic_hash = 0x456789ABCDEF0123ULL;
+    const canard_bytes_chain_t payload    = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
+    canard_txfer_t* tr1 = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, true, 1, 0, 1);
+    TEST_ASSERT_NOT_NULL(tr1);
+    tr1->topic_hash        = topic_hash;
+    tr1->remote_topic_hash = topic_hash;
+    TEST_ASSERT_TRUE(tx_push(&self, tr1, payload, CRC_INITIAL));
+    canard_txfer_t* tr2 = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, false, 1, 0, 2);
+    TEST_ASSERT_NOT_NULL(tr2);
+    tr2->topic_hash        = topic_hash;
+    tr2->remote_topic_hash = topic_hash;
+    TEST_ASSERT_TRUE(tx_push(&self, tr2, payload, CRC_INITIAL));
+    canard_txfer_t* tr3 = make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, true, 1, 0, 3);
+    TEST_ASSERT_NOT_NULL(tr3);
+    tr3->topic_hash        = topic_hash;
+    tr3->remote_topic_hash = topic_hash;
+    TEST_ASSERT_TRUE(tx_push(&self, tr3, payload, CRC_INITIAL));
+    TEST_ASSERT_EQUAL_INT64(HEAT_DEATH, tr2->delayed_until);
+    TEST_ASSERT_EQUAL_INT64(HEAT_DEATH, tr3->delayed_until);
+
+    // Retire the reliable head and promote the backlog.
+    txfer_retire(&self, tr1, true);
+    const byte_t shard = txfer_shard(tr2);
+    TEST_ASSERT_TRUE(is_listed(&self.tx.pending[shard][0], &tr2->list_pending[0]));
+    TEST_ASSERT_TRUE(is_listed(&self.tx.pending[shard][0], &tr3->list_pending[0]));
+    TEST_ASSERT_EQUAL_INT64(BIG_BANG, tr2->delayed_until);
+    TEST_ASSERT_TRUE(tr3->delayed_until > BIG_BANG);
+    TEST_ASSERT_FALSE(is_listed(&self.tx.delayed[shard], &tr2->list_delayed));
+    TEST_ASSERT_TRUE(is_listed(&self.tx.delayed[shard], &tr3->list_delayed));
+
+    // Clean up.
+    txfer_retire(&self, tr2, true);
+    txfer_retire(&self, tr3, true);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_fr.allocated_fragments);
+}
+
+// ==============================================  canard_publish  ==============================================
+
+static void test_canard_publish_pinned_best_effort_v1_0(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+    self.tx.fd = false;
+
+    // Publish a pinned best-effort transfer.
+    const uint8_t              data[]  = { 0xAB };
+    const canard_bytes_chain_t payload = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
+    const bool                 ok =
+      canard_publish(&self, 1000000, 1, canard_prio_nominal, 1, 0, payload, CANARD_USER_CONTEXT_NULL, false);
+    TEST_ASSERT_TRUE(ok);
+    canard_txfer_t* const tr = LIST_HEAD(self.tx.agewise, canard_txfer_t, list_agewise);
+    TEST_ASSERT_NOT_NULL(tr);
+    TEST_ASSERT_EQUAL_size_t(2, FRAME_SIZE(tr->head[0]));
+    TEST_ASSERT_EQUAL_HEX8(0xAB, tr->head[0]->data[0]);
+
+    // Clean up.
+    txfer_retire(&self, tr, true);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_fr.allocated_fragments);
+}
+
+static void test_canard_publish_unpinned_best_effort_v1_1(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+    self.tx.fd = false;
+
+    // Publish an unpinned best-effort transfer.
+    const uint8_t              data[]  = { 0xCD };
+    const canard_bytes_chain_t payload = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
+    const uint64_t             topic   = (uint64_t)CANARD_SUBJECT_ID_MAX_1v0 + 1U;
+    const bool                 ok =
+      canard_publish(&self, 1000000, 1, canard_prio_nominal, topic, 1, payload, CANARD_USER_CONTEXT_NULL, false);
+    TEST_ASSERT_TRUE(ok);
+    canard_txfer_t* const tr = LIST_HEAD(self.tx.agewise, canard_txfer_t, list_agewise);
+    TEST_ASSERT_NOT_NULL(tr);
+    TEST_ASSERT_EQUAL_size_t(6, FRAME_SIZE(tr->head[0]));
+    TEST_ASSERT_EQUAL_HEX8(0xCD, tr->head[0]->data[4]);
+
+    // Clean up.
+    txfer_retire(&self, tr, true);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_fr.allocated_fragments);
+}
+
+static void test_canard_publish_pinned_reliable_v1_1(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+    self.tx.fd = false;
+
+    // Publish a pinned reliable transfer.
+    const uint8_t              data[]  = { 0xEF };
+    const canard_bytes_chain_t payload = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
+    const uint64_t             topic   = 2;
+    const bool                 ok =
+      canard_publish(&self, 1000000, 1, canard_prio_nominal, topic, 2, payload, CANARD_USER_CONTEXT_NULL, true);
+    TEST_ASSERT_TRUE(ok);
+    canard_txfer_t* const tr = LIST_HEAD(self.tx.agewise, canard_txfer_t, list_agewise);
+    TEST_ASSERT_NOT_NULL(tr);
+    TEST_ASSERT_EQUAL_size_t(6, FRAME_SIZE(tr->head[0]));
+    TEST_ASSERT_EQUAL_HEX8(0xEF, tr->head[0]->data[4]);
+
+    // Clean up.
+    txfer_retire(&self, tr, true);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+    TEST_ASSERT_EQUAL_size_t(0, alloc_fr.allocated_fragments);
+}
+
+static void test_canard_0v1_publish_basic(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+    self.node_id = 1;
+
+    // Publish a v0 transfer.
+    const uint8_t              data[]  = { 1, 2 };
+    const canard_bytes_chain_t payload = { .bytes = { .size = sizeof(data), .data = data }, .next = NULL };
+    const bool                 ok = canard_0v1_publish(&self, 1000000, 1, canard_prio_nominal, 10, 0xFFFF, 3, payload);
+    TEST_ASSERT_TRUE(ok);
+    canard_txfer_t* const tr = LIST_HEAD(self.tx.agewise, canard_txfer_t, list_agewise);
+    TEST_ASSERT_NOT_NULL(tr);
+    TEST_ASSERT_FALSE(tr->fd);
+    TEST_ASSERT_EQUAL_size_t(3, FRAME_SIZE(tr->head[0]));
+    TEST_ASSERT_EQUAL_HEX8(1, tr->head[0]->data[0]);
+    TEST_ASSERT_EQUAL_HEX8(2, tr->head[0]->data[1]);
+
+    // Clean up.
+    txfer_retire(&self, tr, true);
     TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
     TEST_ASSERT_EQUAL_size_t(0, alloc_fr.allocated_fragments);
 }
@@ -1502,9 +2040,11 @@ int main(void)
     RUN_TEST(test_tx_push_v0_request);
     RUN_TEST(test_tx_push_v0_response);
     RUN_TEST(test_tx_push_oom_frame_alloc);
+    RUN_TEST(test_tx_push_reliable_oom_removes_index);
     RUN_TEST(test_tx_push_oom_mid_spool);
     RUN_TEST(test_tx_push_queue_capacity_exceeded);
     RUN_TEST(test_tx_push_queue_capacity_too_small);
+    RUN_TEST(test_tx_push_reliable_capacity_failure_removes_index);
     RUN_TEST(test_tx_push_multi_iface_refcount);
     RUN_TEST(test_tx_push_single_iface_refcount);
     RUN_TEST(test_tx_push_multi_frame_multi_iface);
@@ -1518,5 +2058,21 @@ int main(void)
     RUN_TEST(test_tx_push_duplicate_reliable_transfer);
     RUN_TEST(test_tx_push_different_topic_hash_no_blocking);
     RUN_TEST(test_tx_push_pending_transfer_blocks_new);
+    // tx scheduling and retire.
+    RUN_TEST(test_txfer_is_pending_false);
+    RUN_TEST(test_tx_arm_delay_if_reliable_schedules);
+    RUN_TEST(test_txfer_retire_updates_iter);
+    RUN_TEST(test_tx_arm_delay_if_deadline_too_close);
+    RUN_TEST(test_tx_promote_delayed_requeues);
+    RUN_TEST(test_tx_push_sacrifice_oldest);
+    RUN_TEST(test_tx_receive_ack_retires);
+    RUN_TEST(test_tx_receive_ack_scan_miss);
+    RUN_TEST(test_tx_receive_ack_no_match);
+    RUN_TEST(test_txfer_retire_promotes_backlog);
+    // canard_publish.
+    RUN_TEST(test_canard_publish_pinned_best_effort_v1_0);
+    RUN_TEST(test_canard_publish_unpinned_best_effort_v1_1);
+    RUN_TEST(test_canard_publish_pinned_reliable_v1_1);
+    RUN_TEST(test_canard_0v1_publish_basic);
     return UNITY_END();
 }
