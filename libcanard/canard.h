@@ -142,20 +142,6 @@ typedef enum canard_prio_t
 } canard_prio_t;
 #define CANARD_PRIO_COUNT 8U
 
-/// This number must not be less than three bits to ensure that the priority field is handled correctly.
-/// Larger values improve list manipulation performance at the cost of some memory footprint.
-/// - 3 bits ensure that each priority level has its own shard, which is the bare minimum. Not recommended.
-/// - 4 bits ensure that messages and RPC-service transfers are separated into dedicated shards. Recommended minimum.
-/// - 5 bits ensure that messages, requests, and responses are all separated. Good for higher-bandwidth applications.
-/// - More shard bits may be appropriate for some very high-bandwidth applications with many simultaneous transfers.
-#ifndef CANARD_TX_SHARDING_BITS
-#define CANARD_TX_SHARDING_BITS 4U
-#endif
-#if (CANARD_TX_SHARDING_BITS < 3)
-#error "CANARD_TX_SHARDING_BITS must be at least 3; at least 4 for decent prioritization granularity"
-#endif
-#define CANARD_TX_SHARDS (1U << CANARD_TX_SHARDING_BITS)
-
 typedef struct canard_tree_t
 {
     struct canard_tree_t* up;
@@ -331,11 +317,7 @@ typedef struct canard_vtable_t
     ///
     /// The number of remote nodes that acknowledged the reception of the transfer is provided.
     /// For P2P transfers, this value is either 0 (failure) or 1 (success).
-    void (*feedback)(canard_t*,
-                     canard_user_context_t,
-                     uint64_t      topic_hash,
-                     uint_least8_t transfer_id,
-                     uint_least8_t acknowledgements);
+    void (*feedback)(canard_t*, canard_user_context_t, uint_least8_t acknowledgements);
 
     /// Invoked immediately before tx() to obtain the subject-ID for the given transfer.
     /// The application is expected to rely on the user context to access the topic context for subject-ID derivation.
@@ -392,50 +374,10 @@ struct canard_t
         size_t queue_capacity;
         size_t queue_size;
 
-        /// Unlike, say, Cyphal/UDP, Cyphal/CAN is unlikely to deal with a large number of high-bandwidth topics
-        /// due to the limited bus capacity; at the same time, CAN is likely to be used with small memory-limited
-        /// devices. Hence we introduce a design tradeoff favoring smaller memory footprint over insertion efficiency,
-        /// which is reasonable on the assumption that the number of simultaneously enqueued transfers (sic! not frames)
-        /// is typically small, on the order of a couple dozen at most. At small N, linked lists are even expected to
-        /// outperform BST lookup; given r=2 is the approximate complexity premium of BST lookup over list scan,
-        /// assuming that an average list lookup ends halfway, then the complexity crossover point is about:
-        ///
-        ///     N/2 > r log2(N)
-        ///
-        /// So for r=2, we expect linked lists to outperform BSTs for less than about 15 pending transfers per shard
-        /// (per default, RPC-service and message transfers use different shards, also each priority level is separate).
-        /// The number of frames per transfer is irrelevant here as it doesn't affect the asymptotic complexity.
-        ///
-        /// The structures are optimized to minimize the poll complexity, since it is on the hot path, at the expense
-        /// of insertion and cancellation paths. Each pending queue is a simple FIFO; the priority ordering is done
-        /// by having multiple queues, one per TX shard. This does not follow the full CAN ID arbitration order,
-        /// but it is sufficient because the leading sharding bits of the CAN ID provide sufficient selectivity.
-        ///
-        /// The linear lookup complexity is not considered an issue because real-time applications always have a bound
-        /// on the peak number of simultaneously pending transfers, which is typically low due to the limited bus
-        /// capacity; given the fixed bound, the asymptotic complexity is essentially constant time. If performance
-        /// becomes an issue in larger applications, it can be addressed by sharding the lists further.
-        ///
-        /// The pending list contains transfers that are ready to be transmitted immediately.
-        /// The delayed list contains transfers that will become eligible for transmission in the future;
-        /// these are either reliable transfers waiting for their next retransmission attempt unless acknowledged,
-        /// or transfers that are backlogged after pending reliable transfers to maintain the strict transmission
-        /// ordering. Reliable transfers are special in the sense of ordering because the same transfer may be
-        /// promoted to pending more than once, which may cause reordering; the backlog addresses this.
-        ///
-        /// The shards are based on the most significant bits of the CAN ID, meaning that the lowest index shard
-        /// has the highest arbitration priority and should be chosen for transmission first. There is no ordering
-        /// preservation guarantee between priority levels (obviously) so they all are treated as independent lists.
-        /// The pending shards bitmap is used for O(1) fetching of the highest-priority non-empty shard during poll()
-        /// -- no scanning needed.
-        ///
-        /// Unlike Cyphal/UDP, we don't have a dedicated deadline index, again to conserve memory. Instead, we do
-        /// iterative scanning during poll() by storing the iteration cursors here. They are invalidated as needed.
-        uint32_t      pending_shards_bitmap[CANARD_IFACE_COUNT]; ///< Bit index corresponds to non-empty pending shards.
-        canard_list_t pending[CANARD_TX_SHARDS][CANARD_IFACE_COUNT]; ///< Next to transmit at the head.
-        canard_list_t delayed[CANARD_TX_SHARDS]; ///< Soonest retry time at head. HEAT_DEATH if backlogged, at tail.
-        canard_list_t agewise;                   ///< ALL transfers, oldest at the head.
+        canard_tree_t* pending[CANARD_IFACE_COUNT]; ///< Next to transmit at the head.
+        canard_tree_t* staged;   ///< Transfers staged for retransmission, ordered by next transmission time.
         canard_tree_t* reliable; ///< Reliable ordered by (topic hash, transfer-ID) for dup detection and ack.
+        canard_list_t  agewise;  ///< ALL transfers FIFO, oldest at the head.
 
         canard_txfer_t* iter; ///< For iterative poll() scanning; NULL to restart.
     } tx;
@@ -534,10 +476,15 @@ void canard_refcount_dec(canard_t* const self, const canard_bytes_t obj);
 bool canard_unpublish(canard_t* const self, const uint64_t topic_hash, const uint_least8_t transfer_id);
 bool canard_unrespond(canard_t* const self, const uint_least8_t destination_node_id, const uint_least8_t transfer_id);
 
-/// Unless pinned, the subject-ID will be obtained using the dedicated vtable function immediately before transmission.
-/// This is because the topic->subject allocation protocol may change the subject-ID for already enqueued messages.
-/// The application is expected to rely on the user context to access the topic context for subject-ID derivation
-/// (e.g., store a topic pointer in there).
+/// Message ordering observed on the bus is guaranteed per topic as long as best-effort transfers are used and the
+/// priority of later messages is not higher (numerically not lower) than that of earlier messages. Reliable delivery
+/// may distort message ordering due to potential retransmissions. Receivers may restore the ordering depending on the
+/// application requirements.
+///
+/// Unless pinned, the subject-ID will be obtained using the dedicated vtable function immediately before transmission,
+/// and also at the moment of enqueuing the transfer. This is because the topic->subject allocation protocol may change
+/// the subject-ID for already enqueued messages. The application is expected to rely on the user context to access
+/// the topic context for subject-ID derivation (e.g., store a topic pointer in there).
 /// Pinned subject-IDs equal the topic hash and as such do not require postponed resolution.
 bool canard_publish(canard_t* const             self,
                     const canard_us_t           deadline,

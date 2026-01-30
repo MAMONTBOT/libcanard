@@ -80,11 +80,11 @@ typedef unsigned char byte_t;
 typedef enum transfer_kind_t
 {
     transfer_kind_message     = 0,
-    transfer_kind_request     = 1,
-    transfer_kind_response    = 2,
+    transfer_kind_response    = 1,
+    transfer_kind_request     = 2,
     transfer_kind_v0_message  = 3,
-    transfer_kind_v0_request  = 4,
-    transfer_kind_v0_response = 5,
+    transfer_kind_v0_response = 4,
+    transfer_kind_v0_request  = 5,
 } transfer_kind_t;
 
 static bool transfer_kind_is_v0(const transfer_kind_t kind)
@@ -437,13 +437,10 @@ static bool bytes_chain_valid(const canard_bytes_chain_t head)
 // ---------------------------------------------            TX             ---------------------------------------------
 
 /// Derives the ack timeout for an outgoing transfer.
-static canard_us_t tx_ack_timeout(const canard_us_t baseline, const uint32_t can_id, const byte_t attempts)
+static canard_us_t tx_ack_timeout(const canard_us_t baseline, const canard_prio_t prio, const byte_t attempts)
 {
     CANARD_ASSERT(baseline > 0);
-    // What matters is the actual CAN arbitration priority, not the nominal one.
-    // They are equal, but we prefer first-principles derivation here.
-    const byte_t prio = ((can_id & CAN_EXT_ID_MASK) >> PRIO_SHIFT) & PRIO_MASK;
-    CANARD_ASSERT(prio < 8);
+    CANARD_ASSERT(((int)prio) < 8);
     return baseline * (1LL << smaller((size_t)prio + (size_t)attempts, 62)); // NOLINT(*-signed-bitwise)
 }
 
@@ -512,50 +509,44 @@ void canard_refcount_dec(canard_t* const self, const canard_bytes_t obj)
     }
 }
 
-/// We don't know v1.1 subject-ID bits until transmission time so in the CAN ID they are not defined (assume arbitrary).
-/// The local node-ID bits are also set at the transmission time in case it is changed to avoid collisions on the bus.
-///
-/// The fields are weakly arranged to reduce padding, but logical grouping is prioritized.
-/// If o1heap is used and the platform is 32-bit (x4 pointer size overhead per block), a struct up to 112 bytes fits
-/// into a 128-byte block; reducing the footprint does not bring any benefit until <=48 bytes (needs a 64-byte block).
+#define EPOCH_BITS 6U /// More doesn't make sense due to exponential backoff and left shift saturation.
+#define EPOCH_MAX  ((1U << EPOCH_BITS) - 1U)
+
+/// Max delta: 2**29*1e-6 = 536.87 seconds
+#define STAGED_UNTIL_DELTA_BITS 29U
+#define STAGED_UNTIL_DELTA_MAX  ((1ULL << STAGED_UNTIL_DELTA_BITS) - 1ULL)
+
+/// Everything except the local node-ID.
+#define CAN_ID_MSb_BITS (29U - 7U)
+
+/// The struct is manually packed to ensure it fits into a 128-byte O1Heap block in common embedded configurations.
 struct canard_txfer_t
 {
-    // Lookup and ordering indexes.
-    canard_listed_t list_pending[CANARD_IFACE_COUNT];
-    canard_listed_t list_delayed;
+    /// Lookup and ordering indexes.
+    canard_tree_t   index_pending[CANARD_IFACE_COUNT];
+    canard_tree_t   index_staged;
+    canard_tree_t   index_reliable;
     canard_listed_t list_agewise;
-    /// Ordered by (topic hash, transfer-ID), ALL pending reliable transfers.
-    /// Used for:
-    /// - Checking for duplicates when a new reliable transfer is created.
-    /// - Finding the pending reliable transfers waiting for ack when an ack frame is received.
-    canard_tree_t index_reliable;
+
+    /// Constant transfer properties supplied by the client.
+    canard_us_t deadline;
+    uint64_t    topic_hash;
+    uint64_t    can_id_msb     : CAN_ID_MSb_BITS;
+    uint64_t    transfer_id    : CANARD_TRANSFER_ID_BIT_LENGTH;
+    uint64_t    is_1v1_message : 1; ///< Needs delayed subject-ID resolution.
+    uint64_t    fd             : 1;
 
     /// Mutable transmission state. All other fields, except for the index handles, are immutable.
     ///
-    /// We always keep a pointer to the head of the spool, plus a cursor that scans the frames during transmission.
+    /// We keep a pointer to the head of the spool, plus a cursor that scans the frames during transmission.
     /// Both are NULL if the payload is destroyed (i.e., after the last attempt is done and we're waiting for ack).
     /// The head points to the first frame unless it is known that no (further) retransmissions are needed,
     /// in which case the old head is dereferenced and the head points to the next frame to transmit.
+    /// The head is NULL for ifaces where transmission is not needed (anymore).
+    uint64_t    epoch : EPOCH_BITS; ///< No overflow due to exponential backoff; e.g. 1us @ epoch=48 => 9 years.
+    uint64_t    staged_until_delta : STAGED_UNTIL_DELTA_BITS; /// staged_until = deadline - staged_until_delta
     tx_frame_t* head[CANARD_IFACE_COUNT];
     tx_frame_t* cursor[CANARD_IFACE_COUNT];
-    canard_us_t delayed_until; ///< HEAT_DEATH if backlogged; BIG_BANG if not delayed (not in the delayed index).
-    byte_t      epoch;         ///< No overflow due to exponential backoff; e.g. 1us @ epoch=48 => 9 years.
-
-    /// Constant transfer properties supplied by the client.
-    /// The remote_* fields are identical to the local ones except in the case of P2P transfers, where
-    /// they contain the values encoded in the P2P header. This is needed to find pending acks (to minimize duplicates),
-    /// and to report the correct values via the feedback callback for P2P transfers.
-    /// By default, upon construction, the remote_* fields equal the local ones, which is valid for ordinary messages.
-    byte_t      iface_bitmap; ///< Guaranteed to have at least one bit set within CANARD_IFACE_COUNT.
-    byte_t      transfer_id        : 5;
-    byte_t      kind               : 3; ///< transfer_kind_t
-    byte_t      remote_transfer_id : 5;
-    byte_t      fd                 : 1;
-    byte_t      reliable           : 1;
-    uint32_t    can_id; ///< For v1.1 messages, the subject-ID bits are UNDEFINED. Node-ID is always zeroed.
-    uint64_t    topic_hash;
-    uint64_t    remote_topic_hash;
-    canard_us_t deadline;
 
     /// Application context.
     canard_user_context_t user_context;
@@ -566,62 +557,61 @@ static_assert((CANARD_IFACE_COUNT > 2) || (sizeof(void*) > 4) || (sizeof(void (*
 
 static canard_txfer_t* txfer_new(const canard_mem_t          mem,
                                  const canard_us_t           deadline,
-                                 const uint_least8_t         iface_bitmap,
-                                 const uint32_t              can_id,
-                                 const byte_t                transfer_id,
-                                 const bool                  fd,
-                                 const transfer_kind_t       kind,
                                  const uint64_t              topic_hash,
-                                 const canard_user_context_t user_context,
-                                 const bool                  reliable)
+                                 const byte_t                transfer_id,
+                                 const transfer_kind_t       kind,
+                                 const uint32_t              can_id_template,
+                                 const bool                  fd,
+                                 const canard_user_context_t user_context)
 {
-    CANARD_ASSERT(can_id <= CAN_EXT_ID_MASK);
-    CANARD_ASSERT((iface_bitmap & CANARD_IFACE_BITMAP_ALL) != 0);
-    CANARD_ASSERT((iface_bitmap & CANARD_IFACE_BITMAP_ALL) == iface_bitmap);
     canard_txfer_t* const tr = mem_alloc_zero(mem, sizeof(canard_txfer_t));
     if (tr != NULL) {
         FOREACH_IFACE (i) {
-            tr->list_pending[i] = LIST_NULL;
+            tr->index_pending[i] = TREE_NULL;
         }
-        tr->list_delayed   = LIST_NULL;
-        tr->list_agewise   = LIST_NULL;
+        tr->index_staged   = TREE_NULL;
         tr->index_reliable = TREE_NULL;
+        tr->list_agewise   = LIST_NULL;
         //
+        tr->deadline       = deadline;
+        tr->topic_hash     = topic_hash;
+        tr->transfer_id    = transfer_id & CANARD_TRANSFER_ID_MAX;
+        tr->can_id_msb     = (can_id_template >> (29U - CAN_ID_MSb_BITS)) & ((1U << CAN_ID_MSb_BITS) - 1U);
+        tr->is_1v1_message = (kind == transfer_kind_message);
+        tr->fd             = fd ? 1U : 0U;
+        //
+        tr->epoch              = 0;
+        tr->staged_until_delta = 0;
         FOREACH_IFACE (i) {
-            tr->head[i] = tr->cursor[i] = NULL;
+            tr->head[i]   = NULL;
+            tr->cursor[i] = NULL;
         }
-        tr->epoch         = 0;
-        tr->delayed_until = BIG_BANG; ///< Not in the delayed index yet.
-        //
-        tr->iface_bitmap       = iface_bitmap;
-        tr->transfer_id        = transfer_id & CANARD_TRANSFER_ID_MAX;
-        tr->remote_transfer_id = tr->transfer_id;
-        CANARD_ASSERT(kind < 8);
-        tr->kind              = (byte_t)(kind & 7U);
-        tr->fd                = fd;
-        tr->reliable          = reliable;
-        tr->can_id            = can_id;
-        tr->deadline          = deadline;
-        tr->topic_hash        = topic_hash;
-        tr->remote_topic_hash = topic_hash;
-        //
         tr->user_context = user_context;
     }
     return tr;
 }
 
-static byte_t txfer_shard(const canard_txfer_t* const tr)
+static bool txfer_is_reliable(canard_t* const self, canard_txfer_t* const tr)
 {
-    return (byte_t)((tr->can_id >> (29U - CANARD_TX_SHARDING_BITS)) & ((1U << CANARD_TX_SHARDING_BITS) - 1U));
+    return cavl2_is_inserted(self->tx.reliable, &tr->index_reliable);
 }
 
-static bool txfer_is_backlogged(const canard_txfer_t* const tr) { return tr->delayed_until == HEAT_DEATH; }
+static canard_prio_t txfer_prio(const canard_txfer_t* const tr)
+{
+    return (canard_prio_t)((((unsigned)tr->can_id_msb) >> (CAN_ID_MSb_BITS - 3U)) & 7U);
+}
+
+static canard_us_t txfer_staged_until(const canard_txfer_t* const tr)
+{
+    return tr->deadline - (canard_us_t)tr->staged_until_delta;
+}
 
 static bool txfer_is_pending(const canard_t* const self, const canard_txfer_t* const tr)
 {
-    const byte_t shard = txfer_shard(tr);
     FOREACH_IFACE (i) {
-        if (is_listed(&self->tx.pending[shard][i], &tr->list_pending[i])) {
+        if (cavl2_is_inserted(self->tx.pending[i], &tr->index_pending[i])) {
+            CANARD_ASSERT(tr->head[i] != NULL);
+            CANARD_ASSERT(tr->cursor[i] != NULL);
             return true;
         }
     }
@@ -643,39 +633,62 @@ static void txfer_free_payload(canard_t* const self, canard_txfer_t* const tr)
     }
 }
 
-/// Updates the next attempt time and inserts the transfer into the delayed index, unless the next scheduled
+static int32_t tx_cavl_compare_staged_until(const void* const user, const canard_tree_t* const node)
+{
+    return ((*(const canard_us_t*)user) >= txfer_staged_until(CAVL2_TO_OWNER(node, canard_txfer_t, index_staged))) ? +1
+                                                                                                                   : -1;
+}
+
+/// Updates the next attempt time and inserts the transfer into the staged index, unless the next scheduled
 /// transmission time is too close to the deadline, in which case no further attempts will be made.
-///
 /// The idea is that retransmitting the transfer too close to the deadline is pointless, because
 /// the ack may arrive just after the deadline and the transfer would be considered failed anyway.
 /// The solution is to add a small margin before the deadline. The margin is derived using a simple heuristic,
 /// which is subject to review and improvement later on (this is not an API-visible trait).
-static void tx_arm_delay_if(canard_t* const self, canard_txfer_t* const tr)
+static void tx_stage_reliable_if(canard_t* const self, canard_txfer_t* const tr)
 {
-    const byte_t shard = txfer_shard(tr);
-    if (!tr->reliable) {
-        delist(&self->tx.delayed[shard], &tr->list_delayed);
-        tr->delayed_until = BIG_BANG;
+    CANARD_ASSERT(txfer_is_reliable(self, tr));
+    const byte_t      epoch            = tr->epoch++;
+    const canard_us_t timeout          = tx_ack_timeout(self->ack_baseline_timeout, txfer_prio(tr), epoch);
+    canard_us_t       new_staged_until = txfer_staged_until(tr);
+    if (new_staged_until == tr->deadline) {
+        CANARD_ASSERT(!cavl2_is_inserted(self->tx.reliable, &tr->index_reliable));
+        new_staged_until = self->vtable->now(self); // this is the first attempt
     } else {
-        const byte_t      epoch             = tr->epoch++;
-        const canard_us_t timeout           = tx_ack_timeout(self->ack_baseline_timeout, tr->can_id, epoch);
-        canard_us_t       new_delayed_until = tr->delayed_until;
-        if ((new_delayed_until < 0) || (new_delayed_until == HEAT_DEATH)) {
-            new_delayed_until = self->vtable->now(self); // this is the first attempt
-        }
-        new_delayed_until += timeout;
-        if ((tr->deadline - timeout) >= new_delayed_until) {
-            tr->delayed_until = new_delayed_until;
-            LIST_FIND_FIRST(self->tx.delayed[shard],
-                            canard_txfer_t,
-                            list_delayed,
-                            anchor,
-                            (anchor->delayed_until > tr->delayed_until));
-            CANARD_ASSERT((tr->delayed_until != BIG_BANG) && (tr->delayed_until != HEAT_DEATH));
-            enlist_before(&self->tx.delayed[shard], anchor ? &anchor->list_delayed : NULL, &tr->list_delayed);
-        } else {
-            delist(&self->tx.delayed[shard], &tr->list_delayed);
-            tr->delayed_until = BIG_BANG;
+        CANARD_ASSERT(cavl2_is_inserted(self->tx.reliable, &tr->index_reliable));
+        cavl2_remove(&self->tx.reliable, &tr->index_reliable);
+    }
+    new_staged_until += timeout;
+    if ((tr->deadline - timeout) >= new_staged_until) {
+        const canard_us_t delta = min_i64(tr->deadline - new_staged_until, (canard_us_t)STAGED_UNTIL_DELTA_MAX);
+        CANARD_ASSERT(delta > 0);
+        tr->staged_until_delta          = ((uint64_t)delta) & STAGED_UNTIL_DELTA_MAX;
+        const canard_tree_t* const tree = cavl2_find_or_insert(&self->tx.reliable,
+                                                               &new_staged_until,
+                                                               tx_cavl_compare_staged_until,
+                                                               &tr->index_staged,
+                                                               cavl2_trivial_factory);
+        CANARD_ASSERT(tree == &tr->index_staged);
+        (void)tree;
+    }
+}
+
+static int32_t tx_cavl_compare_pending_order(const void* const user, const canard_tree_t* const node)
+{
+    const canard_txfer_t* const lhs = (const canard_txfer_t*)user;
+    const canard_txfer_t* const rhs = CAVL2_TO_OWNER(node, canard_txfer_t, index_pending[0]);
+    return (lhs->can_id_msb >= rhs->can_id_msb) ? +1 : -1;
+}
+
+static void tx_make_pending(canard_t* const self, canard_txfer_t* const tr)
+{
+    FOREACH_IFACE (i) { // Enqueue for transmission unless it's there already (stalled interface?)
+        if (((tr->head[i] != NULL)) && !cavl2_is_inserted(self->tx.pending[i], &tr->index_pending[i])) {
+            CANARD_ASSERT(tr->cursor[i] == tr->head[i]); // must have been rewound after last attempt
+            const canard_tree_t* const tree = cavl2_find_or_insert(
+              &self->tx.pending[i], tr, tx_cavl_compare_pending_order, &tr->index_pending[i], cavl2_trivial_factory);
+            CANARD_ASSERT(tree == &tr->index_pending[i]);
+            (void)tree;
         }
     }
 }
@@ -698,65 +711,22 @@ static void tx_arm_delay_if(canard_t* const self, canard_txfer_t* const tr)
 /// where pub/sub associations are established and removed automatically, transparently to the application.
 static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const bool success)
 {
-    const uint64_t              topic_hash   = tr->remote_topic_hash;
-    const byte_t                transfer_id  = tr->remote_transfer_id;
     const canard_user_context_t user_context = tr->user_context;
-    const byte_t                shard        = txfer_shard(tr);
-    const bool                  reliable     = tr->reliable;
-    const bool                  backlogged   = txfer_is_backlogged(tr);
+    const bool                  reliable     = txfer_is_reliable(self, tr);
 
     // Delist everywhere. Remember that delisting a non-listed entity is a safe no-op.
     if (self->tx.iter == tr) {
         self->tx.iter = LIST_NEXT(tr, canard_txfer_t, list_agewise); // May be NULL, is OK.
     }
     FOREACH_IFACE (i) {
-        if ((tr->iface_bitmap & (1U << i)) != 0) {
-            CANARD_ASSERT(((self->tx.pending_shards_bitmap[i] & (1U << shard)) != 0U) || backlogged);
-            delist(&self->tx.pending[shard][i], &tr->list_pending[i]);
-            if (self->tx.pending[shard][i].head == NULL) {
-                self->tx.pending_shards_bitmap[i] &= ~(1U << shard);
-            }
-        }
+        (void)cavl2_remove_if(&self->tx.pending[i], &tr->index_pending[i]);
     }
-    delist(&self->tx.delayed[shard], &tr->list_delayed);
-    delist(&self->tx.agewise, &tr->list_agewise);
+    (void)cavl2_remove_if(&self->tx.staged, &tr->index_staged);
     if (reliable) {
         CANARD_ASSERT(cavl2_is_inserted(self->tx.reliable, &tr->index_reliable));
         cavl2_remove(&self->tx.reliable, &tr->index_reliable);
     }
-
-    // If the transfer was not backlogged, it may have been blocking other transfers, but only if it is reliable.
-    // Best-effort transfers do not block anything because in the presence of a stalled interface they may take a
-    // very long time to time out. This implies that concurrent best-effort and reliable transfers on the same topic
-    // may be reordered, which we accept.
-    // The backlog is ordered with the oldest at the head, so the first topic match is the correct one to promote.
-    if ((!backlogged) && reliable) {
-        canard_txfer_t* that = LIST_HEAD(self->tx.delayed[shard], canard_txfer_t, list_delayed);
-        while (that != NULL) {
-            CANARD_ASSERT(that->delayed_until != BIG_BANG);
-            canard_txfer_t* const next = LIST_NEXT(that, canard_txfer_t, list_delayed);
-            if ((that->topic_hash == tr->topic_hash) && txfer_is_backlogged(that)) {
-                // Found a backlogged transfer on the same topic. It must be promoted now.
-                CANARD_ASSERT((that->iface_bitmap & CANARD_IFACE_BITMAP_ALL) != 0);
-                FOREACH_IFACE (i) { // Append to the pending transmission lists for all requested interfaces.
-                    CANARD_ASSERT(!is_listed(&self->tx.pending[shard][i], &that->list_pending[i]));
-                    if ((that->iface_bitmap & (1U << i)) != 0U) {
-                        CANARD_ASSERT(that->cursor[i] == that->head[i]); // must be rewound to the beginning
-                        CANARD_ASSERT(that->cursor[i] != NULL);
-                        enlist_tail(&self->tx.pending[shard][i], &that->list_pending[i]);
-                        self->tx.pending_shards_bitmap[i] |= (1U << shard);
-                    }
-                }
-                tx_arm_delay_if(self, that);
-                // If this is a reliable transfer, no further promotions can take place -- the rest are backlogged
-                // behind the reliable one. All best-effort transfers can be promoted at once though.
-                if (that->reliable) {
-                    break;
-                }
-            }
-            that = next;
-        }
-    }
+    delist(&self->tx.agewise, &tr->list_agewise);
 
     // Free the memory. The payload memory may already be empty depending on where we were invoked from.
     txfer_free_payload(self, tr);
@@ -764,7 +734,7 @@ static void txfer_retire(canard_t* const self, canard_txfer_t* const tr, const b
 
     // Finally, when the internal state is updated and consistent, invoke the feedback callback if any.
     if (reliable) {
-        self->vtable->feedback(self, user_context, topic_hash, transfer_id, success ? 1 : 0);
+        self->vtable->feedback(self, user_context, success ? 1 : 0);
     }
 }
 
@@ -969,29 +939,15 @@ static bool tx_ensure_queue_space(canard_t* const self, const size_t total_frame
     return total_frames_needed <= (self->tx.queue_capacity - self->tx.queue_size);
 }
 
-static void tx_promote_delayed(canard_t* const self, const canard_us_t now)
+static void tx_promote_staged(canard_t* const self, const canard_us_t now)
 {
-    for (byte_t shard = 0; shard < CANARD_TX_SHARDS; shard++) { // Low shards have max arbitration priority
-        while (true) {
-            canard_txfer_t* const tr = LIST_HEAD(self->tx.delayed[shard], canard_txfer_t, list_delayed);
-            if ((tr != NULL) && (now >= tr->delayed_until)) {
-                CANARD_ASSERT(tr->delayed_until > BIG_BANG);
-                // Reinsert into the delayed index at the new position, when the next attempt is due (if any).
-                tx_arm_delay_if(self, tr);
-                FOREACH_IFACE (i) { // Enqueue for transmission unless it's there already (stalled interface?)
-                    const bool add = ((tr->iface_bitmap & (1U << i)) != 0) &&
-                                     !is_listed(&self->tx.pending[shard][i], &tr->list_pending[i]);
-                    if (add) {
-                        CANARD_ASSERT(tr->head[i] != NULL);          // cannot stage without payload, doesn't make sense
-                        CANARD_ASSERT(tr->cursor[i] == tr->head[i]); // must have been rewound after last attempt
-                        enlist_tail(&self->tx.pending[shard][i], &tr->list_pending[i]);
-                        self->tx.pending_shards_bitmap[i] |= (1U << shard);
-                    }
-                }
-            } else {
-                break;
-            }
-        }
+    canard_txfer_t* tr = CAVL2_TO_OWNER(cavl2_min(self->tx.staged), canard_txfer_t, index_staged);
+    while ((tr != NULL) && (now >= txfer_staged_until(tr))) {
+        canard_txfer_t* const next =
+          CAVL2_TO_OWNER(cavl2_next_greater(&tr->index_staged), canard_txfer_t, index_staged);
+        tx_stage_reliable_if(self, tr);
+        tx_make_pending(self, tr);
+        tr = next;
     }
 }
 
@@ -1007,22 +963,26 @@ static size_t tx_predict_frame_count(const size_t transfer_size, const size_t mt
 /// Enqueues a transfer for transmission.
 static bool tx_push(canard_t* const            self,
                     canard_txfer_t* const      tr,
+                    const bool                 reliable,
+                    const bool                 v0,
+                    const byte_t               iface_bitmap,
                     const canard_bytes_chain_t payload,
                     const uint16_t             crc_seed)
 {
     CANARD_ASSERT(tr != NULL);
-    CANARD_ASSERT((!tr->fd) || !transfer_kind_is_v0(tr->kind)); // The caller must ensure this.
+    CANARD_ASSERT((!tr->fd) || !v0); // The caller must ensure this.
     const canard_us_t now = self->vtable->now(self);
 
-    // Promote delayed transfers that have become eligible for retransmission to ensure fairness:
+    // Promote staged transfers that have become eligible for retransmission to ensure fairness:
     // if they have the same arbitration priority as the new transfer, they should get a chance to go first.
-    tx_promote_delayed(self, now);
+    tx_promote_staged(self, now);
 
-    // Ensure there are no duplicate reliable transfers with the same local (topic hash, transfer-ID).
+    // Ensure there are no duplicate reliable transfers with the same local (topic hash, transfer-ID) to avoid
+    // ack ambiguity. A delayed ack can still cause issues but tracking that is too expensive for CAN.
     // This does not affect outgoing acks since they are not reliable. This may affect the application if it is
     // trying to push too many reliable transfers on the same topic too quickly.
     // Insert at the same time to avoid double tree walk.
-    if (tr->reliable) {
+    if (reliable) {
         const txfer_key_t           key = { .topic_hash = tr->topic_hash, .transfer_id = tr->transfer_id };
         const canard_txfer_t* const rel = CAVL2_TO_OWNER(
           cavl2_find_or_insert(
@@ -1043,7 +1003,7 @@ static bool tx_push(canard_t* const            self,
     CANARD_ASSERT(n_frames > 0);
     if (!tx_ensure_queue_space(self, n_frames)) {
         self->err.tx_capacity++;
-        if (tr->reliable) {
+        if (reliable) {
             CANARD_ASSERT(cavl2_is_inserted(self->tx.reliable, &tr->index_reliable));
             cavl2_remove(&self->tx.reliable, &tr->index_reliable);
         }
@@ -1053,11 +1013,11 @@ static bool tx_push(canard_t* const            self,
 
     // Make a shared frame spool. Unlike the Cyphal/UDP implementation, we require all ifaces to use the same MTU.
     const size_t      queue_size_before = self->tx.queue_size;
-    tx_frame_t* const spool = transfer_kind_is_v0(tr->kind) ? tx_spool_v0(self, crc_seed, tr->transfer_id, payload)
-                                                            : tx_spool(self, crc_seed, mtu, tr->transfer_id, payload);
+    tx_frame_t* const spool             = v0 ? tx_spool_v0(self, crc_seed, tr->transfer_id, payload)
+                                             : tx_spool(self, crc_seed, mtu, tr->transfer_id, payload);
     if (spool == NULL) {
         self->err.oom++;
-        if (tr->reliable) {
+        if (reliable) {
             CANARD_ASSERT(cavl2_is_inserted(self->tx.reliable, &tr->index_reliable));
             cavl2_remove(&self->tx.reliable, &tr->index_reliable);
         }
@@ -1067,7 +1027,9 @@ static bool tx_push(canard_t* const            self,
     CANARD_ASSERT((self->tx.queue_size - queue_size_before) == n_frames);
     CANARD_ASSERT(self->tx.queue_size <= self->tx.queue_capacity);
     (void)queue_size_before;
-    const byte_t frame_refcount_inc = (byte_t)(popcount(tr->iface_bitmap) - 1U);
+
+    // Adjust the spooled frame refcounts to avoid premature deallocation.
+    const byte_t frame_refcount_inc = (byte_t)(popcount(iface_bitmap) - 1U);
     CANARD_ASSERT(frame_refcount_inc < CANARD_IFACE_COUNT);
     if (frame_refcount_inc > 0) {
         tx_frame_t* frame = spool;
@@ -1079,67 +1041,17 @@ static bool tx_push(canard_t* const            self,
 
     // Attach the spool.
     FOREACH_IFACE (i) {
-        if ((tr->iface_bitmap & (1U << i)) != 0) {
+        if ((iface_bitmap & (1U << i)) != 0) {
             tr->head[i]   = spool;
             tr->cursor[i] = spool;
         }
     }
 
-    // Register the transfer.
+    // Register the transfer and schedule for transmission.
     enlist_tail(&self->tx.agewise, &tr->list_agewise);
-
-    // We need to ensure that same-topic transfers at the same priority level are sent strictly in the push order.
-    // For best-effort transfers this is trivial as all we need to do is to enqueue them as-is.
-    // Reliable transfers, however, break this order because they may be retransmitted multiple times, and if any
-    // other transfer (any QoS) is enqueued while at least one reliable transfer is pending, reordering may result,
-    // because the pending reliable transfer may retransmit, breaking the transfer ordering seen on the wire.
-    //
-    // Thus, before we enqueue, we need to check if there are any reliable transfers on the same priority shard
-    // and same topic pending for transmission or waiting for a retransmission; if there are, the new transfer
-    // goes into the backlog, where it will wait until the transfer ahead of it is either successfully delivered
-    // or timed out.
-    //
-    // If there are no such transfers, it can be enqueued immediately; observe that there may still be some reliable
-    // transfers waiting for ack, but if such transfers are neither pending nor delayed, it means that they have
-    // completed the last transmission attempt, no further attempts will be made, and thus no reordering can occur.
-    const byte_t shard                  = txfer_shard(tr);
-    bool         has_preceding_reliable = false;
-    {
-        const txfer_key_t key = { .topic_hash = tr->topic_hash, .transfer_id = 0 };
-        canard_txfer_t*   rel = CAVL2_TO_OWNER(
-          cavl2_lower_bound(self->tx.reliable, &key, tx_cavl_compare_reliable), canard_txfer_t, index_reliable);
-        while ((rel != NULL) && (rel->topic_hash == tr->topic_hash)) {
-            if ((rel != tr) && (txfer_shard(rel) == shard)) {
-                // Check if the transfer is delayed (waiting for retransmission) or pending (waiting for first tx).
-                const bool delayed = rel->delayed_until > BIG_BANG; // In delayed list, waiting for retransmission.
-                const bool pending = txfer_is_pending(self, rel);
-                CANARD_ASSERT((!delayed) || is_listed(&self->tx.delayed[shard], &rel->list_delayed));
-                if (delayed || pending) {
-                    has_preceding_reliable = true;
-                    break;
-                }
-            }
-            rel = CAVL2_TO_OWNER(cavl2_next_greater(&rel->index_reliable), canard_txfer_t, index_reliable);
-        }
-    }
-
-    // Schedule for transmission or backlog depending on the findings above.
-    if (has_preceding_reliable) { // into the backlog you go, buddy
-        tr->delayed_until = HEAT_DEATH;
-        enlist_tail(&self->tx.delayed[shard], &tr->list_delayed); // FIFO, newest at the tail.
-    } else {
-        FOREACH_IFACE (i) {
-            if ((tr->iface_bitmap & (1U << i)) != 0) {
-                enlist_tail(&self->tx.pending[shard][i], &tr->list_pending[i]);
-                self->tx.pending_shards_bitmap[i] |= (1U << shard);
-            }
-        }
-        // tx_arm_delay_if is NOT called here; the retransmission timer is armed after transmission, not before.
-        // The transfer remains with delayed_until = BIG_BANG (set by txfer_new), ready for immediate transmission.
-        // For unreliable transfers, no retransmission is scheduled. For reliable transfers, the retransmission will be
-        // scheduled after the first transmission attempt completes.
-        CANARD_ASSERT(tr->delayed_until == BIG_BANG);
-    }
+    tx_make_pending(self, tr);
+    // tx_arm_delay_if is NOT called here; the retransmission timer is armed after transmission, not before.
+    // For reliable transfers, the retransmission will be scheduled once the first transmission attempt completes.
     return true;
 }
 
@@ -1191,13 +1103,16 @@ bool canard_publish(canard_t* const             self,
         if (use_1v0) {
             can_id |= (3UL << 21U) | (uint32_t)(topic_hash << 8U); // set reserved bits 21 and 22
         } else {
-            can_id |= (1UL << 7U); // reserved bit 7 indicates v1.1 message; subject-ID will be set later
-            // We don't know the subject-ID yet, so we could leave the corresponding bits zeroed, but that would cause
-            // poor sharding if the shard bit count exceeds 4. The most significant bit of the subject-ID maps to the
-            // anonymous bit of v1.0, which is nearly always zero, so we force it to 1 to improve sharding.
-            // The remaining bits are taken from the topic hash to further improve sharding.
-            // All of these will be rewritten with the proper subject-ID at transmission time.
-            can_id |= (1UL << 24U) | (uint32_t)((topic_hash & 0xFFFFUL) << 8U);
+            // The subject-ID may change before the transfer makes it to the transmission queue output,
+            // so we could leave the corresponding bits zeroed, but we instead set them using the current best-guess
+            // topic allocation data to improve arbitration order predictability; this makes sense because topic
+            // allocation collisions are exceedingly rare; i.e., the subject-ID obtained here is very likely to be
+            // the same as the one that will be used at transmission time.
+            const uint32_t subject_id = self->vtable->tx_subject_id(self, context);
+            ok                        = ok && (subject_id <= CANARD_SUBJECT_ID_MAX);
+            if (ok) {
+                can_id |= (subject_id << 8U) | (1UL << 7U); // reserved bit 7 indicates v1.1 message
+            }
         }
 
         // Compose the message header, unless v1.0 -- those have no header. See docs for CANARD_HEADER_MESSAGE_BYTES.
@@ -1213,17 +1128,17 @@ bool canard_publish(canard_t* const             self,
         const canard_bytes_chain_t final_payload = use_1v0 ? payload : headed_payload;
 
         // Create and push the transfer.
-        canard_txfer_t* const tr = txfer_new(self->mem.tx_transfer,
-                                             deadline,
-                                             iface_bitmap,
-                                             can_id,
-                                             transfer_id,
-                                             self->tx.fd,
-                                             transfer_kind_message,
-                                             topic_hash,
-                                             context,
-                                             reliable);
-        ok                       = (tr != NULL) && tx_push(self, tr, final_payload, CRC_INITIAL);
+        if (ok) {
+            canard_txfer_t* const tr = txfer_new(self->mem.tx_transfer,
+                                                 deadline,
+                                                 topic_hash,
+                                                 transfer_id,
+                                                 transfer_kind_message,
+                                                 can_id,
+                                                 self->tx.fd,
+                                                 context);
+            ok = (tr != NULL) && tx_push(self, tr, reliable, false, iface_bitmap, final_payload, CRC_INITIAL);
+        }
     }
     return ok;
 }
@@ -1245,15 +1160,13 @@ bool canard_0v1_publish(canard_t* const            self,
         const uint32_t can_id    = (((uint32_t)priority) << PRIO_SHIFT) | (3UL << 24U) | ((uint32_t)data_type_id << 8U);
         canard_txfer_t* const tr = txfer_new(self->mem.tx_transfer,
                                              deadline,
-                                             iface_bitmap,
-                                             can_id,
-                                             transfer_id,
-                                             false, // CAN FD is not supported with v0
-                                             transfer_kind_v0_message,
                                              TOPIC_HASH_MSb_v0_MESSAGE | data_type_id,
-                                             CANARD_USER_CONTEXT_NULL,
-                                             NULL);
-        ok                       = (tr != NULL) && tx_push(self, tr, payload, crc_seed);
+                                             transfer_id,
+                                             transfer_kind_v0_message,
+                                             can_id,
+                                             false, // CAN FD is not supported with v0
+                                             CANARD_USER_CONTEXT_NULL);
+        ok                       = (tr != NULL) && tx_push(self, tr, false, true, iface_bitmap, payload, crc_seed);
     }
     return ok;
 }
