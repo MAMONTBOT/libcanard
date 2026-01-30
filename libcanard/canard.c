@@ -111,9 +111,7 @@ const uint_least8_t canard_len_to_dlc[65] = {
 static size_t      smaller(const size_t a, const size_t b) { return (a < b) ? a : b; }
 static size_t      larger(const size_t a, const size_t b) { return (a > b) ? a : b; }
 static int64_t     min_i64(const int64_t a, const int64_t b) { return (a < b) ? a : b; }
-static int64_t     max_i64(const int64_t a, const int64_t b) { return (a > b) ? a : b; }
 static canard_us_t earlier(const canard_us_t a, const canard_us_t b) { return min_i64(a, b); }
-static canard_us_t later(const canard_us_t a, const canard_us_t b) { return max_i64(a, b); }
 
 /// Used if intrinsics are not available.
 /// http://en.wikipedia.org/wiki/Hamming_weight#Efficient_implementation
@@ -298,35 +296,6 @@ static void delist(canard_list_t* const list, canard_listed_t* const member)
     CANARD_ASSERT((list->head != NULL) == (list->tail != NULL));
 }
 
-/// Insert addendum after anchor. If anchor is NULL, insert at the head.
-/// If the item is already in the list, it will be delisted first. Can be used for moving to the specified position.
-static void enlist_after(canard_list_t* const list, canard_listed_t* const anchor, canard_listed_t* const addendum)
-{
-    delist(list, addendum);
-    CANARD_ASSERT((addendum->next == NULL) && (addendum->prev == NULL));
-    CANARD_ASSERT((list->head != NULL) == (list->tail != NULL));
-    if (anchor == NULL) {
-        addendum->next = list->head;
-        if (list->head != NULL) {
-            list->head->prev = addendum;
-        }
-        list->head = addendum;
-        if (list->tail == NULL) {
-            list->tail = addendum;
-        }
-    } else {
-        addendum->prev = anchor;
-        addendum->next = anchor->next;
-        if (anchor->next != NULL) {
-            anchor->next->prev = addendum;
-        } else {
-            list->tail = addendum;
-        }
-        anchor->next = addendum;
-    }
-    CANARD_ASSERT((list->head != NULL) && (list->tail != NULL));
-}
-
 /// Insert addendum before anchor. If anchor is NULL, insert at the tail.
 /// If the item is already in the list, it will be delisted first. Can be used for moving to the specified position.
 static void enlist_before(canard_list_t* const list, canard_listed_t* const anchor, canard_listed_t* const addendum)
@@ -357,7 +326,6 @@ static void enlist_before(canard_list_t* const list, canard_listed_t* const anch
 }
 
 /// If the item is already in the list, it will be delisted first. Can be used for moving to the front/back.
-static void enlist_head(canard_list_t* const list, canard_listed_t* const member) { enlist_after(list, NULL, member); }
 static void enlist_tail(canard_list_t* const list, canard_listed_t* const member) { enlist_before(list, NULL, member); }
 
 #define LIST_TAIL(list, owner_type, owner_field) LIST_MEMBER((list).tail, owner_type, owner_field)
@@ -591,7 +559,7 @@ static canard_txfer_t* txfer_new(const canard_mem_t          mem,
     return tr;
 }
 
-static bool txfer_is_reliable(canard_t* const self, canard_txfer_t* const tr)
+static bool txfer_is_reliable(const canard_t* const self, const canard_txfer_t* const tr)
 {
     return cavl2_is_inserted(self->tx.reliable, &tr->index_reliable);
 }
@@ -818,7 +786,7 @@ static tx_frame_t* tx_spool(canard_t* const            self,
                 }
                 // Insert the CRC.
                 if ((frame_offset < frame_size) && (offset == size)) {
-                    tail->data[frame_offset] = (byte_t)((crc >> 8U) & BYTE_MAX);
+                    tail->data[frame_offset] = (byte_t)((crc >> 8U) & BYTE_MAX); // NOLINT(*-signed-bitwise)
                     ++frame_offset;
                     ++offset;
                 }
@@ -855,16 +823,16 @@ static tx_frame_t* tx_spool_v0(canard_t* const            self,
         }
         return item;
     }
-    const uint16_t             crc                       = crc_add_chain(crc_seed, payload);
-    const byte_t               crc_bytes[CRC_SIZE_BYTES] = { (byte_t)((crc >> 0U) & BYTE_MAX), // v0 little-endian CRC
-                                                             (byte_t)((crc >> 8U) & BYTE_MAX) };
-    const size_t               size_total                = size + CRC_SIZE_BYTES;
-    const canard_bytes_chain_t payload_total             = { .bytes = { .size = CRC_SIZE_BYTES, .data = crc_bytes },
-                                                             .next  = &payload };
-    bytes_chain_reader_t       reader                    = { .cursor = &payload_total, .position = 0U };
-    tx_frame_t*                head                      = NULL;
-    tx_frame_t*                tail                      = NULL;
-    size_t                     offset                    = 0U;
+    const uint16_t crc = crc_add_chain(crc_seed, payload);
+    // NOLINTNEXTLINE(*-signed-bitwise) v0 CRC is little-endian, which is not the native ordering of CRC-16-CCITT.
+    const byte_t crc_bytes[CRC_SIZE_BYTES]   = { (byte_t)((crc >> 0U) & BYTE_MAX), (byte_t)((crc >> 8U) & BYTE_MAX) };
+    const size_t size_total                  = size + CRC_SIZE_BYTES;
+    const canard_bytes_chain_t payload_total = { .bytes = { .size = CRC_SIZE_BYTES, .data = crc_bytes },
+                                                 .next  = &payload };
+    bytes_chain_reader_t       reader        = { .cursor = &payload_total, .position = 0U };
+    tx_frame_t*                head          = NULL;
+    tx_frame_t*                tail          = NULL;
+    size_t                     offset        = 0U;
     while (offset < size_total) {
         tx_frame_t* const item = tx_frame_new(self, smaller((size_total - offset) + 1U, CANARD_MTU_CAN_CLASSIC));
         if (NULL == head) {
