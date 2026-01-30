@@ -29,6 +29,7 @@ cmake-build-*/
 .pydevproject
 .gdbinit
 .vscode/
+.sisyphys/
 **/.idea/*
 !**/.idea/dictionaries
 !**/.idea/dictionaries/*
