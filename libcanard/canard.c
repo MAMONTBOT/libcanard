@@ -601,10 +601,29 @@ static void txfer_free_payload(canard_t* const self, canard_txfer_t* const tr)
     }
 }
 
+// Key for the staged index ordering.
+typedef struct
+{
+    canard_us_t           when;
+    const canard_txfer_t* tr;
+} tx_staged_key_t;
+
 static int32_t tx_cavl_compare_staged_until(const void* const user, const canard_tree_t* const node)
 {
-    return ((*(const canard_us_t*)user) >= txfer_staged_until(CAVL2_TO_OWNER(node, canard_txfer_t, index_staged))) ? +1
-                                                                                                                   : -1;
+    // Use the transfer pointer as a stable tiebreaker for equal timestamps.
+    const canard_txfer_t* const  rhs      = CAVL2_TO_OWNER(node, canard_txfer_t, index_staged);
+    const canard_us_t            rhs_when = txfer_staged_until(rhs);
+    const tx_staged_key_t* const key      = (const tx_staged_key_t*)user;
+    if (key->when < rhs_when) {
+        return -1;
+    }
+    if (key->when > rhs_when) {
+        return +1;
+    }
+    if (key->tr < rhs) {
+        return -1;
+    }
+    return (key->tr > rhs) ? +1 : 0;
 }
 
 /// Updates the next attempt time and inserts the transfer into the staged index, unless the next scheduled
@@ -630,19 +649,66 @@ static void tx_stage_reliable_if(canard_t* const self, canard_txfer_t* const tr)
     if ((tr->deadline - timeout) >= new_staged_until) {
         const canard_us_t delta = min_i64(tr->deadline - new_staged_until, (canard_us_t)STAGED_UNTIL_DELTA_MAX);
         CANARD_ASSERT(delta > 0);
-        tr->staged_until_delta          = ((uint64_t)delta) & STAGED_UNTIL_DELTA_MAX;
+        tr->staged_until_delta = ((uint64_t)delta) & STAGED_UNTIL_DELTA_MAX;
+        // Composite key ensures equal timestamps are ordered deterministically.
+        const tx_staged_key_t      key  = { .when = new_staged_until, .tr = tr };
         const canard_tree_t* const tree = cavl2_find_or_insert(
-          &self->tx.staged, &new_staged_until, tx_cavl_compare_staged_until, &tr->index_staged, cavl2_trivial_factory);
+          &self->tx.staged, &key, tx_cavl_compare_staged_until, &tr->index_staged, cavl2_trivial_factory);
         CANARD_ASSERT(tree == &tr->index_staged);
         (void)tree;
     }
+}
+
+// Compare transfer-ID with wraparound support (5-bit, +/-16).
+static int8_t tx_compare_transfer_id(const byte_t lhs, const byte_t rhs)
+{
+    const uint8_t diff_u = (uint8_t)((lhs - rhs) & CANARD_TRANSFER_ID_MAX);
+    int16_t       diff   = (int16_t)diff_u;
+    if (diff > (int16_t)(CANARD_TRANSFER_ID_MAX / 2U)) {
+        diff = (int16_t)(diff - (int16_t)(CANARD_TRANSFER_ID_MAX + 1U));
+    }
+    return (int8_t)diff;
 }
 
 static int32_t tx_cavl_compare_pending_order(const void* const user, const canard_tree_t* const node)
 {
     const canard_txfer_t* const lhs = (const canard_txfer_t*)user;
     const canard_txfer_t* const rhs = CAVL2_TO_OWNER(node, canard_txfer_t, index_pending[0]);
-    return (lhs->can_id_msb >= rhs->can_id_msb) ? +1 : -1;
+    // Same topic hash: order by priority then FIFO by transfer-ID (wraparound), then by deadline.
+    if (lhs->topic_hash == rhs->topic_hash) {
+        const canard_prio_t lhs_prio = txfer_prio(lhs);
+        const canard_prio_t rhs_prio = txfer_prio(rhs);
+        if (lhs_prio < rhs_prio) {
+            return -1;
+        }
+        if (lhs_prio > rhs_prio) {
+            return +1;
+        }
+        const int8_t tid_diff = tx_compare_transfer_id((byte_t)lhs->transfer_id, (byte_t)rhs->transfer_id);
+        if (tid_diff != 0) {
+            return (tid_diff < 0) ? -1 : +1;
+        }
+        // Best-effort transfers may reuse transfer-ID; use deadline as a tiebreaker.
+        if (lhs->deadline < rhs->deadline) {
+            return -1;
+        }
+        if (lhs->deadline > rhs->deadline) {
+            return +1;
+        }
+    } else {
+        // Different topic hash: sooner deadline first.
+        if (lhs->deadline < rhs->deadline) {
+            return -1;
+        }
+        if (lhs->deadline > rhs->deadline) {
+            return +1;
+        }
+    }
+    // Final arbitrary tiebreaker to enforce strict ordering.
+    if (lhs < rhs) {
+        return -1;
+    }
+    return (lhs > rhs) ? +1 : 0;
 }
 
 static void tx_make_pending(canard_t* const self, canard_txfer_t* const tr)

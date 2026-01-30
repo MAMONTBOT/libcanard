@@ -1160,6 +1160,152 @@ static void test_tx_push_fifo_same_priority(void)
     TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
 }
 
+// Ensure pending order wraps transfer-ID for same topic and priority.
+static void test_tx_pending_same_topic_tid_wrap(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+
+    const canard_bytes_chain_t payload = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
+    const uint32_t             can_id  = ((uint32_t)canard_prio_nominal << PRIO_SHIFT);
+    const uint64_t             topic   = 0xAABBCCDDU;
+    canard_txfer_t*            tr1     = make_test_transfer(
+      self.mem.tx_transfer, transfer_kind_message, true, topic, can_id, 30, CANARD_USER_CONTEXT_NULL);
+    canard_txfer_t* tr2 =
+      make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, topic, can_id, 2, CANARD_USER_CONTEXT_NULL);
+    TEST_ASSERT_NOT_NULL(tr1);
+    TEST_ASSERT_NOT_NULL(tr2);
+
+    TEST_ASSERT_TRUE(tx_push(&self, tr1, false, false, 1, payload, CRC_INITIAL));
+    TEST_ASSERT_TRUE(tx_push(&self, tr2, false, false, 1, payload, CRC_INITIAL));
+
+    canard_txfer_t* const head = CAVL2_TO_OWNER(cavl2_min(self.tx.pending[0]), canard_txfer_t, index_pending[0]);
+    TEST_ASSERT_EQUAL_PTR(tr1, head);
+
+    txfer_retire(&self, tr2, true);
+    txfer_retire(&self, tr1, true);
+}
+
+// Same transfer-ID uses deadline as a tiebreaker.
+static void test_tx_pending_same_topic_tid_deadline(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+
+    const canard_bytes_chain_t payload = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
+    const uint32_t             can_id  = ((uint32_t)canard_prio_nominal << PRIO_SHIFT);
+    const uint64_t             topic   = 0xDEADBEEFULL;
+    canard_txfer_t*            tr1 =
+      make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, topic, can_id, 5, CANARD_USER_CONTEXT_NULL);
+    canard_txfer_t* tr2 =
+      make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, topic, can_id, 5, CANARD_USER_CONTEXT_NULL);
+    TEST_ASSERT_NOT_NULL(tr1);
+    TEST_ASSERT_NOT_NULL(tr2);
+    tr1->deadline = 10;
+    tr2->deadline = 20;
+
+    TEST_ASSERT_TRUE(tx_push(&self, tr1, false, false, 1, payload, CRC_INITIAL));
+    TEST_ASSERT_TRUE(tx_push(&self, tr2, false, false, 1, payload, CRC_INITIAL));
+
+    canard_txfer_t* const head = CAVL2_TO_OWNER(cavl2_min(self.tx.pending[0]), canard_txfer_t, index_pending[0]);
+    TEST_ASSERT_EQUAL_PTR(tr1, head);
+
+    txfer_retire(&self, tr2, true);
+    txfer_retire(&self, tr1, true);
+}
+
+// Different topic hash uses deadline ordering.
+static void test_tx_pending_diff_topic_deadline(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+
+    const canard_bytes_chain_t payload = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
+    const uint32_t             can_id  = ((uint32_t)canard_prio_nominal << PRIO_SHIFT);
+    canard_txfer_t*            tr1 =
+      make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, 1, can_id, 1, CANARD_USER_CONTEXT_NULL);
+    canard_txfer_t* tr2 =
+      make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, 2, can_id, 2, CANARD_USER_CONTEXT_NULL);
+    TEST_ASSERT_NOT_NULL(tr1);
+    TEST_ASSERT_NOT_NULL(tr2);
+    tr1->deadline = 20;
+    tr2->deadline = 10;
+
+    TEST_ASSERT_TRUE(tx_push(&self, tr1, false, false, 1, payload, CRC_INITIAL));
+    TEST_ASSERT_TRUE(tx_push(&self, tr2, false, false, 1, payload, CRC_INITIAL));
+
+    canard_txfer_t* const head = CAVL2_TO_OWNER(cavl2_min(self.tx.pending[0]), canard_txfer_t, index_pending[0]);
+    TEST_ASSERT_EQUAL_PTR(tr2, head);
+
+    txfer_retire(&self, tr2, true);
+    txfer_retire(&self, tr1, true);
+}
+
+// Cover comparator branches for staged and pending trees.
+static void test_tx_comparator_branches(void)
+{
+    canard_txfer_t tr[2];
+    memset(&tr, 0, sizeof(tr));
+
+    // Staged compare: when < rhs.
+    tr[1].deadline           = 100;
+    tr[1].staged_until_delta = 10; // staged_until = 90
+    tx_staged_key_t key      = { .when = 80, .tr = &tr[0] };
+    TEST_ASSERT_EQUAL_INT32(-1, tx_cavl_compare_staged_until(&key, &tr[1].index_staged));
+
+    // Staged compare: when > rhs.
+    key.when = 100;
+    TEST_ASSERT_EQUAL_INT32(+1, tx_cavl_compare_staged_until(&key, &tr[1].index_staged));
+
+    // Staged compare: pointer tiebreak.
+    key.when = 90;
+    TEST_ASSERT_EQUAL_INT32(-1, tx_cavl_compare_staged_until(&key, &tr[1].index_staged));
+
+    // Transfer-ID wraparound compare.
+    TEST_ASSERT_TRUE(tx_compare_transfer_id(30, 2) < 0);
+
+    // Pending compare: priority order.
+    tr[0].topic_hash = 1;
+    tr[1].topic_hash = 1;
+    tr[0].can_id_msb = (uint32_t)(1U << (CAN_ID_MSb_BITS - 3U));
+    tr[1].can_id_msb = (uint32_t)(2U << (CAN_ID_MSb_BITS - 3U));
+    TEST_ASSERT_EQUAL_INT32(-1, tx_cavl_compare_pending_order(&tr[0], &tr[1].index_pending[0]));
+
+    // Pending compare: same transfer-ID uses deadline.
+    tr[0].can_id_msb  = tr[1].can_id_msb;
+    tr[0].transfer_id = 5;
+    tr[1].transfer_id = 5;
+    tr[0].deadline    = 10;
+    tr[1].deadline    = 20;
+    TEST_ASSERT_EQUAL_INT32(-1, tx_cavl_compare_pending_order(&tr[0], &tr[1].index_pending[0]));
+
+    // Pending compare: different topic uses deadline.
+    tr[0].topic_hash = 1;
+    tr[1].topic_hash = 2;
+    tr[0].deadline   = 30;
+    tr[1].deadline   = 20;
+    TEST_ASSERT_EQUAL_INT32(+1, tx_cavl_compare_pending_order(&tr[0], &tr[1].index_pending[0]));
+
+    // Pending compare: pointer tiebreakers.
+    tr[0].topic_hash  = 3;
+    tr[1].topic_hash  = 3;
+    tr[0].transfer_id = 7;
+    tr[1].transfer_id = 7;
+    tr[0].deadline    = 40;
+    tr[1].deadline    = 40;
+    TEST_ASSERT_EQUAL_INT32(-1, tx_cavl_compare_pending_order(&tr[0], &tr[1].index_pending[0]));
+    TEST_ASSERT_EQUAL_INT32(+1, tx_cavl_compare_pending_order(&tr[1], &tr[0].index_pending[0]));
+}
+
 static void test_tx_make_pending_orders(void)
 {
     canard_t                 self;
@@ -1332,6 +1478,39 @@ static void test_tx_stage_reliable_if_inserts(void)
 
     txfer_retire(&self, tr, true);
     TEST_ASSERT_EQUAL_size_t(0, alloc_tr.allocated_fragments);
+}
+
+// Equal staged timestamps must not collide in the staged tree.
+static void test_tx_stage_reliable_if_tiebreak(void)
+{
+    canard_t                 self;
+    instrumented_allocator_t alloc_tr;
+    instrumented_allocator_t alloc_fr;
+    test_context_t           ctx;
+    setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
+    self.ack_baseline_timeout = 1;
+    ctx.now                   = 100;
+
+    const canard_bytes_chain_t payload = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
+    canard_txfer_t*            tr1 =
+      make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, 1, 0, 1, CANARD_USER_CONTEXT_NULL);
+    canard_txfer_t* tr2 =
+      make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, 1, 0, 2, CANARD_USER_CONTEXT_NULL);
+    TEST_ASSERT_NOT_NULL(tr1);
+    TEST_ASSERT_NOT_NULL(tr2);
+    tr1->deadline = 1000000;
+    tr2->deadline = 1000000;
+
+    TEST_ASSERT_TRUE(tx_push(&self, tr1, true, false, 1, payload, CRC_INITIAL));
+    TEST_ASSERT_TRUE(tx_push(&self, tr2, true, false, 1, payload, CRC_INITIAL));
+
+    tx_stage_reliable_if(&self, tr1);
+    tx_stage_reliable_if(&self, tr2);
+    TEST_ASSERT_TRUE(cavl2_is_inserted(self.tx.staged, &tr1->index_staged));
+    TEST_ASSERT_TRUE(cavl2_is_inserted(self.tx.staged, &tr2->index_staged));
+
+    txfer_retire(&self, tr2, true);
+    txfer_retire(&self, tr1, true);
 }
 
 static void test_tx_stage_reliable_if_orders(void)
@@ -1576,6 +1755,10 @@ int main(void)
     RUN_TEST(test_tx_push_sacrifice_oldest);
     RUN_TEST(test_tx_push_duplicate_reliable_transfer);
     RUN_TEST(test_tx_push_fifo_same_priority);
+    RUN_TEST(test_tx_pending_same_topic_tid_wrap);
+    RUN_TEST(test_tx_pending_same_topic_tid_deadline);
+    RUN_TEST(test_tx_pending_diff_topic_deadline);
+    RUN_TEST(test_tx_comparator_branches);
     RUN_TEST(test_tx_make_pending_orders);
     RUN_TEST(test_tx_receive_ack_retires_feedback);
     RUN_TEST(test_tx_receive_ack_scan_miss);
@@ -1584,6 +1767,7 @@ int main(void)
     RUN_TEST(test_txfer_is_pending_false);
     RUN_TEST(test_txfer_retire_updates_iter);
     RUN_TEST(test_tx_stage_reliable_if_inserts);
+    RUN_TEST(test_tx_stage_reliable_if_tiebreak);
     RUN_TEST(test_tx_stage_reliable_if_orders);
     RUN_TEST(test_tx_stage_reliable_if_deadline_too_close);
     RUN_TEST(test_tx_promote_staged_requeues);
