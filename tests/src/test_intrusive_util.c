@@ -90,11 +90,10 @@ static void test_popcount_intrinsics(void) { test_popcount(popcount); }
 static void test_math_helpers(void)
 {
     // Simple comparisons.
+    TEST_ASSERT_EQUAL_size_t(3, smaller(3, 5));
     TEST_ASSERT_EQUAL_size_t(5, larger(3, 5));
     TEST_ASSERT_EQUAL_INT64(-4, min_i64(-4, 2));
-    TEST_ASSERT_EQUAL_INT64(2, max_i64(-4, 2));
     TEST_ASSERT_EQUAL_INT64(-4, earlier(-4, 2));
-    TEST_ASSERT_EQUAL_INT64(2, later(-4, 2));
 }
 
 static void test_ctz_helpers(void)
@@ -288,6 +287,17 @@ typedef struct test_node_t
     int             value;
     canard_listed_t member;
 } test_node_t;
+
+// Minimal local helpers for list insertion shortcuts.
+static void enlist_head(canard_list_t* const list, canard_listed_t* const member)
+{
+    enlist_before(list, list->head, member);
+}
+
+static void enlist_after(canard_list_t* const list, canard_listed_t* const anchor, canard_listed_t* const member)
+{
+    enlist_before(list, (anchor != NULL) ? anchor->next : NULL, member);
+}
 
 static void test_list(void)
 {

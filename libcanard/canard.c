@@ -420,7 +420,7 @@ typedef struct tx_frame_t
 {
     struct tx_frame_t* next;
     size_t refcount : (sizeof(size_t) * CHAR_BIT) - DLC_BITS; ///< 268+ million ought to be enough for anybody
-    size_t dlc      : DLC_BITS;                               ///< use canard_len_to_dlc[] and canard_dlc_to_len[]
+    size_t dlc : DLC_BITS;                                    ///< use canard_len_to_dlc[] and canard_dlc_to_len[]
     byte_t data[];
 } tx_frame_t;
 static_assert((sizeof(void*) > 4) || ((sizeof(tx_frame_t) + CANARD_MTU_CAN_CLASSIC) <= 24),
@@ -499,8 +499,8 @@ struct canard_txfer_t
     /// Constant transfer properties supplied by the client.
     canard_us_t deadline;
     uint64_t    topic_hash;
-    uint64_t    can_id_msb     : CAN_ID_MSb_BITS;
-    uint64_t    transfer_id    : CANARD_TRANSFER_ID_BIT_LENGTH;
+    uint64_t    can_id_msb : CAN_ID_MSb_BITS;
+    uint64_t    transfer_id : CANARD_TRANSFER_ID_BIT_LENGTH;
     uint64_t    is_1v1_message : 1; ///< Needs delayed subject-ID resolution.
     uint64_t    fd             : 1;
 
@@ -620,22 +620,19 @@ static void tx_stage_reliable_if(canard_t* const self, canard_txfer_t* const tr)
     const canard_us_t timeout          = tx_ack_timeout(self->ack_baseline_timeout, txfer_prio(tr), epoch);
     canard_us_t       new_staged_until = txfer_staged_until(tr);
     if (new_staged_until == tr->deadline) {
-        CANARD_ASSERT(!cavl2_is_inserted(self->tx.reliable, &tr->index_reliable));
+        CANARD_ASSERT(!cavl2_is_inserted(self->tx.staged, &tr->index_staged));
         new_staged_until = self->vtable->now(self); // this is the first attempt
     } else {
-        CANARD_ASSERT(cavl2_is_inserted(self->tx.reliable, &tr->index_reliable));
-        cavl2_remove(&self->tx.reliable, &tr->index_reliable);
+        CANARD_ASSERT(cavl2_is_inserted(self->tx.staged, &tr->index_staged));
+        cavl2_remove(&self->tx.staged, &tr->index_staged);
     }
     new_staged_until += timeout;
     if ((tr->deadline - timeout) >= new_staged_until) {
         const canard_us_t delta = min_i64(tr->deadline - new_staged_until, (canard_us_t)STAGED_UNTIL_DELTA_MAX);
         CANARD_ASSERT(delta > 0);
         tr->staged_until_delta          = ((uint64_t)delta) & STAGED_UNTIL_DELTA_MAX;
-        const canard_tree_t* const tree = cavl2_find_or_insert(&self->tx.reliable,
-                                                               &new_staged_until,
-                                                               tx_cavl_compare_staged_until,
-                                                               &tr->index_staged,
-                                                               cavl2_trivial_factory);
+        const canard_tree_t* const tree = cavl2_find_or_insert(
+          &self->tx.staged, &new_staged_until, tx_cavl_compare_staged_until, &tr->index_staged, cavl2_trivial_factory);
         CANARD_ASSERT(tree == &tr->index_staged);
         (void)tree;
     }

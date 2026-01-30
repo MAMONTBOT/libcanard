@@ -51,6 +51,28 @@ static void test_canard_0v1_publish_requires_node_id(void)
     TEST_ASSERT_FALSE(canard_0v1_publish(&self, 0, 1, canard_prio_nominal, 1, 0xFFFF, 0, payload));
 }
 
+// Provide a subject-ID that is out of range.
+static uint32_t bad_subject_id(canard_t* const self, const canard_user_context_t context)
+{
+    (void)self;
+    (void)context;
+    return CANARD_SUBJECT_ID_MAX + 1U;
+}
+
+// Reject unpinned publish when subject-ID resolution fails.
+static void test_canard_publish_subject_id_out_of_range(void)
+{
+    canard_t        self   = {};
+    canard_vtable_t vtable = {};
+    vtable.tx_subject_id   = bad_subject_id;
+    self.vtable            = &vtable;
+
+    const canard_bytes_chain_t payload = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
+    const uint64_t             topic   = (uint64_t)CANARD_SUBJECT_ID_MAX_1v0 + 1U;
+    TEST_ASSERT_FALSE(
+      canard_publish(&self, 0, 1, canard_prio_nominal, topic, 0, payload, CANARD_USER_CONTEXT_NULL, false));
+}
+
 extern "C" void setUp() {}
 extern "C" void tearDown() {}
 
@@ -62,6 +84,7 @@ int main()
     RUN_TEST(test_canard_publish_validation);
     RUN_TEST(test_canard_publish_oom);
     RUN_TEST(test_canard_0v1_publish_requires_node_id);
+    RUN_TEST(test_canard_publish_subject_id_out_of_range);
 
     return UNITY_END();
 }
