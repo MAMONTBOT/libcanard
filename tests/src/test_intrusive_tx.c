@@ -1346,7 +1346,7 @@ static void test_tx_receive_ack_retires_feedback(void)
     int                         tag          = 7;
     const canard_user_context_t user_context = make_user_context(&tag);
     const uint64_t              topic_hash   = 0x123456789ABCDEF0ULL;
-    const uint64_t              lower_bound  = topic_hash & CANARD_P2P_TOPIC_HASH_LOWER_BOUND_MASK;
+    const uint64_t              lower_bound  = topic_hash & ACK_TOPIC_HASH_LOWER_BOUND_MASK;
     const canard_bytes_chain_t  payload      = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
     canard_txfer_t*             tr =
       make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, topic_hash, 0, 1, user_context);
@@ -1370,7 +1370,7 @@ static void test_tx_receive_ack_scan_miss(void)
     setup_canard_for_tx_push(&self, &alloc_tr, &alloc_fr, &ctx);
 
     const uint64_t             topic_hash  = 0x123456789ABCDEF0ULL;
-    const uint64_t             lower_bound = topic_hash & CANARD_P2P_TOPIC_HASH_LOWER_BOUND_MASK;
+    const uint64_t             lower_bound = topic_hash & ACK_TOPIC_HASH_LOWER_BOUND_MASK;
     const canard_bytes_chain_t payload     = { .bytes = { .size = 0, .data = NULL }, .next = NULL };
     canard_txfer_t*            tr1 =
       make_test_transfer(self.mem.tx_transfer, transfer_kind_message, true, topic_hash, 0, 1, CANARD_USER_CONTEXT_NULL);
