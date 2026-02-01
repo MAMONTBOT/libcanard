@@ -43,6 +43,11 @@
 #define CAVL2_ASSERT(x) CANARD_ASSERT(x) // NOSONAR
 #include <cavl2.h>
 
+/// Poison identifiers that may be unavailable in some MCUs (like DSP cores).
+/// This is wonky and should be instead replaced with a static analysis check!
+#define int8_t  (instead use int_least8_t or signed char)
+#define uint8_t (instead use uint_least8_t or unsigned char or byte_t)
+
 typedef unsigned char byte_t;
 
 #define BYTE_MAX 0xFFU
@@ -420,7 +425,7 @@ typedef struct tx_frame_t
 {
     struct tx_frame_t* next;
     size_t refcount : (sizeof(size_t) * CHAR_BIT) - DLC_BITS; ///< 268+ million ought to be enough for anybody
-    size_t dlc : DLC_BITS;                                    ///< use canard_len_to_dlc[] and canard_dlc_to_len[]
+    size_t dlc      : DLC_BITS;                               ///< use canard_len_to_dlc[] and canard_dlc_to_len[]
     byte_t data[];
 } tx_frame_t;
 static_assert((sizeof(void*) > 4) || ((sizeof(tx_frame_t) + CANARD_MTU_CAN_CLASSIC) <= 24),
@@ -481,10 +486,13 @@ void canard_refcount_dec(canard_t* const self, const canard_bytes_t obj)
 #define EPOCH_MAX  ((1U << EPOCH_BITS) - 1U)
 
 /// Max delta: 2**29*1e-6 = 536.87 seconds
+/// This is kept narrow because the transfer state has to be kept compact to conserve heap memory.
 #define STAGED_UNTIL_DELTA_BITS 29U
 #define STAGED_UNTIL_DELTA_MAX  ((1ULL << STAGED_UNTIL_DELTA_BITS) - 1ULL)
 
-/// Everything except the local node-ID.
+/// Everything except the local node-ID. The node-ID is not needed because it may be changed while the transfer
+/// is enqueued if a collision is detected; also, it is easy to add, and it is the same for all enqueued transfers,
+/// hence it would not affect the ordering.
 #define CAN_ID_MSb_BITS (29U - 7U)
 
 /// The struct is manually packed to ensure it fits into a 128-byte O1Heap block in common embedded configurations.
@@ -499,8 +507,8 @@ struct canard_txfer_t
     /// Constant transfer properties supplied by the client.
     canard_us_t deadline;
     uint64_t    topic_hash;
-    uint64_t    can_id_msb : CAN_ID_MSb_BITS;
-    uint64_t    transfer_id : CANARD_TRANSFER_ID_BIT_LENGTH;
+    uint64_t    can_id_msb     : CAN_ID_MSb_BITS;
+    uint64_t    transfer_id    : CANARD_TRANSFER_ID_BIT_LENGTH;
     uint64_t    is_1v1_message : 1; ///< Needs delayed subject-ID resolution.
     uint64_t    fd             : 1;
 
@@ -660,14 +668,14 @@ static void tx_stage_reliable_if(canard_t* const self, canard_txfer_t* const tr)
 }
 
 // Compare transfer-ID with wraparound support (5-bit, +/-16).
-static int8_t tx_compare_transfer_id(const byte_t lhs, const byte_t rhs)
+static int_least8_t tx_compare_transfer_id(const byte_t lhs, const byte_t rhs)
 {
-    const uint8_t diff_u = (uint8_t)((lhs - rhs) & CANARD_TRANSFER_ID_MAX);
-    int16_t       diff   = (int16_t)diff_u;
+    const byte_t diff_u = (byte_t)((byte_t)(lhs - rhs) & CANARD_TRANSFER_ID_MAX);
+    int16_t      diff   = (int16_t)diff_u;
     if (diff > (int16_t)(CANARD_TRANSFER_ID_MAX / 2U)) {
         diff = (int16_t)(diff - (int16_t)(CANARD_TRANSFER_ID_MAX + 1U));
     }
-    return (int8_t)diff;
+    return (int_least8_t)diff;
 }
 
 static int32_t tx_cavl_compare_pending_order(const void* const user, const canard_tree_t* const node)
@@ -684,7 +692,7 @@ static int32_t tx_cavl_compare_pending_order(const void* const user, const canar
         if (lhs_prio > rhs_prio) {
             return +1;
         }
-        const int8_t tid_diff = tx_compare_transfer_id((byte_t)lhs->transfer_id, (byte_t)rhs->transfer_id);
+        const int_least8_t tid_diff = tx_compare_transfer_id((byte_t)lhs->transfer_id, (byte_t)rhs->transfer_id);
         if (tid_diff != 0) {
             return (tid_diff < 0) ? -1 : +1;
         }
@@ -1086,31 +1094,27 @@ static bool tx_push(canard_t* const            self,
     return true;
 }
 
+/// We only have 64 bits - 8 bits tail byte - 5 bits transfer-ID = 51 bits for topic hash lower bound.
+#define ACK_TOPIC_HASH_LOWER_BOUND_MASK 0xFFFFFFFFFFFFE000ULL
+
 /// Handle an ACK received from a remote node.
-/// The topic and transfer-ID are referring to the LOCAL values, not REMOTE, because the remote doesn't care about the
-/// payload of the transfer and doesn't see the P2P header.
 /// Note an important design decision: acks are identified by topic hash, not subject-ID, because the subject-ID may be
 /// changed by the consensus protocol at any moment while the transfer is pending.
-/// We match only 49 bits out of 64 but this is enough to achieve a negligible probability of collision.
 static void tx_receive_ack(canard_t* const self, const uint64_t topic_hash_lower_bound, const byte_t transfer_id)
 {
-    const txfer_key_t key = { .topic_hash  = topic_hash_lower_bound & CANARD_P2P_TOPIC_HASH_LOWER_BOUND_MASK,
-                              .transfer_id = transfer_id };
-    canard_txfer_t* tr = CAVL2_TO_OWNER(cavl2_lower_bound(self->tx.reliable, &key, tx_cavl_compare_reliable), // ------
-                                        canard_txfer_t,
-                                        index_reliable);
-    if ((tr == NULL) || ((tr->topic_hash & CANARD_P2P_TOPIC_HASH_LOWER_BOUND_MASK) != topic_hash_lower_bound)) {
-        return;
+    // We use lower bound lookup simply because we don't have the 13 least significant bits.
+    // We don't really need them for a unique lookup because the collision probability is negligible.
+    const txfer_key_t     key = { .topic_hash  = topic_hash_lower_bound & ACK_TOPIC_HASH_LOWER_BOUND_MASK,
+                                  .transfer_id = transfer_id };
+    canard_txfer_t* const tr = CAVL2_TO_OWNER(cavl2_lower_bound(self->tx.reliable, &key, tx_cavl_compare_reliable), //--
+                                              canard_txfer_t,
+                                              index_reliable);
+    if ((tr != NULL) && ((tr->topic_hash & ACK_TOPIC_HASH_LOWER_BOUND_MASK) == topic_hash_lower_bound) &&
+        (tr->transfer_id == transfer_id)) {
+        txfer_retire(self, tr, true);
+    } else {
+        self->err.ack_orphans++;
     }
-    // Linear scan to find the matching transfer ID. This is bounded by the max transfer-ID count (32).
-    while ((tr != NULL) && ((tr->topic_hash & CANARD_P2P_TOPIC_HASH_LOWER_BOUND_MASK) == topic_hash_lower_bound)) {
-        if (tr->transfer_id == transfer_id) { // Found!
-            txfer_retire(self, tr, true);
-            break;
-        }
-        tr = CAVL2_TO_OWNER(cavl2_next_greater(&tr->index_reliable), canard_txfer_t, index_reliable);
-    }
-    // If not found, is fine -- probably a duplicate ACK or a remote error.
 }
 
 bool canard_publish(canard_t* const             self,
@@ -1147,11 +1151,9 @@ bool canard_publish(canard_t* const             self,
         }
 
         // Compose the message header, unless v1.0 -- those have no header. See docs for CANARD_HEADER_MESSAGE_BYTES.
-        byte_t                     header_bytes[CANARD_HEADER_MESSAGE_BYTES] = { 0 };
-        const canard_bytes_chain_t headed_payload                            = {
-                                       .bytes = { .size = CANARD_HEADER_MESSAGE_BYTES, .data = header_bytes },
-                                       .next  = &payload,
-        };
+        byte_t                     header_bytes[CANARD_HEADER_BYTES] = { 0 };
+        const canard_bytes_chain_t headed_payload = { .bytes = { .size = CANARD_HEADER_BYTES, .data = header_bytes },
+                                                      .next  = &payload };
         if (!use_1v0) {
             const uint32_t header = (uint32_t)(((topic_hash >> 32U) & 0xFFFFFFFCUL) | (reliable ? 1U : 0U));
             (void)serialize_u32(header_bytes, header);

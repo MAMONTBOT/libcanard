@@ -65,6 +65,27 @@ extern "C"
 /// Cyphal v1.1 does not support anonymous messages so this value is never used there.
 #define CANARD_NODE_ID_ANONYMOUS 0xFFU
 
+/// Cyphal/CAN v1.1 uses dedicated service-IDs for P2P messages and for reliable delivery acks.
+///
+/// Reliable P2P messages (delivery acknowledgement required) are sent with the request-not-response bit set,
+/// while best-effort P2P messages are sent with that bit cleared; that bit can be called "reliable P2P bit".
+/// This sets the best-effort arbitration priority above all reliable P2P messages within the same priority level.
+/// There is no header inserted for P2P messages; the transport just delivers the blob to the specified remote as-is.
+///
+/// Reliable delivery acks are sent as 7-byte transfers with the request-not-response bit cleared.
+/// The acks are sent at the same priority level as the transfer being acknowledged.
+/// The ack payload format is as follows, in DSDL format (fits in a single-frame Classic CAN transfer):
+///
+///     uint5  transfer_id      # The transfer-ID of the acknowledged transfer.
+///     uint51 topic_hash_msb   # The most significant bits of the topic hash of the acknowledged transfer.
+///
+/// The following service-IDs are currently in use in Cyphal v1.0 and must be avoided:
+/// 384, 385, 390, 391, 405, 406, 407, 408, 409, 430, 434, 435, 500, 510.
+/// Due to CAN arbitration rules, lower service-IDs take precedence given the same priority level and the same
+/// request-not-response bit.
+#define CANARD_SERVICE_ID_P2P 511U
+#define CANARD_SERVICE_ID_ACK 504U
+
 /// This is the recommended transfer-ID timeout value given in the Cyphal Specification. The application may choose
 /// different values per subscription (i.e., per data specifier) depending on its timing requirements.
 /// Within this timeout, the library will refuse to accept a transfer with the same transfer-ID as the last one
@@ -76,10 +97,10 @@ extern "C"
 #define CANARD_MTU_CAN_CLASSIC 8U
 #define CANARD_MTU_CAN_FD      64U
 
-/// All v1.1 transfers have payload headers, handled by the library transparently for the application,
-/// that carry additional metadata pertaining to named topics and P2P traffic. v1.0 transfers have no such headers.
+/// All v1.1 message transfers have payload headers, handled by the library transparently for the application,
+/// that carry additional metadata pertaining to named topics. v1.0 transfers have no such headers.
 ///
-/// Together, the 17-bit subject-ID plus the 30-bit topic hash MSB provide a total of 47 bits for topic discrimination,
+/// Together, the 17-bit subject-ID plus the 30-bit topic hash MSb provide a total of 47 bits for topic discrimination,
 /// which is sufficient to avoid collisions. CRC seeding is not used because it adds little value in CAN FD, where
 /// multi-frame transfers are relatively rare due to the large MTU. With 47 bits, the probability of a collision
 /// given 1000 topics is less than one in 200 million.
@@ -89,29 +110,9 @@ extern "C"
 ///     uint30 topic_hash_msb   # The most significant bits of the topic hash for collision detection.
 ///     # Payload follows.
 ///
-/// v1.1 P2P transfers (7 bytes to fit into a single Classic CAN frame):
-///     uint2  kind             # 0=acknowledgment, 1=response reliable, rest reserved.
-///     uint5  transfer_id      # The original transfer-ID this P2P message relates to.
-///     uint13 topic_hash_lsb   # The least significant bits of the original topic hash this P2P message relates to.
-///     uint36 topic_hash_msb   # The most significant bits. The LSb equal the subject-ID for pinned topics, rest zero.
-///     # Payload follows (unless ack).
-///
-/// v1.0 messages are always best-effort (no delivery ack) because there is no header to communicate the ack request.
-/// The P2P header includes the least significant bits as well as the most significant bits of the topic hash to
-/// allow replying to pinned topics, where all topic hash bits are zeros except for the 13 LSb.
-///
 /// A single-frame v1.1 transfer can carry at most 59 bytes of payload in CAN FD, and at most 3 bytes in Classic CAN.
-#define CANARD_HEADER_MESSAGE_BYTES 4U
-#define CANARD_HEADER_P2P_BYTES     7U
-
-#define CANARD_P2P_TOPIC_HASH_MSb_COUNT 36U
-
-/// That would be 49 bits in total, providing excellent collision resistance for all conceivable scenarios.
-/// The MSb/LSb split ensures selectivity for pinned and non-pinned topics alike.
-/// We cannot use full 64 bits because we want the P2P header to fit into a single Classic CAN frame (7 byte payload).
-#define CANARD_P2P_TOPIC_HASH_LOWER_BOUND_MASK                                                        \
-    (((((1ULL << CANARD_P2P_TOPIC_HASH_MSb_COUNT) - 1U) << (64U - CANARD_P2P_TOPIC_HASH_MSb_COUNT)) | \
-      CANARD_SUBJECT_ID_MAX_1v0))
+/// v1.0 messages are always best-effort (no delivery ack) because there is no header to communicate the ack request.
+#define CANARD_HEADER_BYTES 4U
 
 /// See canard_t::ack_baseline_timeout.
 /// This default value might be a good starting point for many applications.
@@ -396,9 +397,10 @@ struct canard_t
     struct
     {
         uint64_t oom;           ///< Out of memory; a transfer could have been lost.
-        uint64_t ack;           ///< An ack could not be enqueued. Other counters may provide more details.
+        uint64_t ack_failed;    ///< An ack could not be enqueued. Other counters may provide more details.
+        uint64_t ack_orphans;   ///< An ack was received for a non-existent transfer.
         uint64_t tx_capacity;   ///< A transfer could not be enqueued due to queue capacity limit.
-        uint64_t tx_sacrifice;  ///< A transfer had to be sacrificed to make room for a new transfer.
+        uint64_t tx_sacrifice;  ///< An old pending transfer had to be sacrificed to make room for a new transfer.
         uint64_t tx_expiration; ///< A transfer had to be dequeued due to deadline expiration.
         uint64_t tx_duplicate;  ///< A transfer with the same topic hash and transfer-ID is already pending.
         uint64_t rx_frame;      ///< A received frame was malformed and thus dropped.
@@ -408,8 +410,13 @@ struct canard_t
     canard_mem_set_t mem;
     uint64_t         prng_state;
 
-    canard_subscription_t p2p_subscription;
-    uint_least8_t         p2p_transfer_id[CANARD_NODE_ID_CAPACITY];
+    /// P2P message subscriptions, reliable and best-effort.
+    canard_subscription_t p2p_rel_sub;
+    canard_subscription_t p2p_bef_sub;
+
+    /// P2P transfer-ID tracking for transmission per remote node.
+    uint_least8_t p2p_rel_transfer_id[CANARD_NODE_ID_CAPACITY];
+    uint_least8_t p2p_bef_transfer_id[CANARD_NODE_ID_CAPACITY];
 
     const canard_vtable_t* vtable;
 
@@ -496,15 +503,13 @@ bool canard_publish(canard_t* const             self,
                     const canard_user_context_t context,
                     const bool                  reliable);
 
-bool canard_respond(canard_t* const             self,
-                    const canard_us_t           deadline,
-                    const uint_least8_t         destination_node_id,
-                    const canard_prio_t         priority,
-                    const uint64_t              request_topic_hash,
-                    const uint_least8_t         request_transfer_id,
-                    const canard_bytes_chain_t  payload,
-                    const canard_user_context_t context,
-                    const bool                  reliable);
+bool canard_p2p(canard_t* const             self,
+                const canard_us_t           deadline,
+                const uint_least8_t         destination_node_id,
+                const canard_prio_t         priority,
+                const canard_bytes_chain_t  payload,
+                const canard_user_context_t context,
+                const bool                  reliable);
 
 bool canard_subscribe(canard_t* const                           self,
                       canard_subscription_t* const              subscription,
