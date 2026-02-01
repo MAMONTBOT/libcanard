@@ -43,11 +43,6 @@
 #define CAVL2_ASSERT(x) CANARD_ASSERT(x) // NOSONAR
 #include <cavl2.h>
 
-/// Poison identifiers that may be unavailable in some MCUs (like DSP cores).
-/// This is wonky and should be instead replaced with a static analysis check!
-#define int8_t  (instead use int_least8_t or signed char)
-#define uint8_t (instead use uint_least8_t or unsigned char or byte_t)
-
 typedef unsigned char byte_t;
 
 #define BYTE_MAX 0xFFU
